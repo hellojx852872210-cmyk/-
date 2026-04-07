@@ -1,0 +1,23 @@
+.DS_Store
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+zhuanzhuan_pricing/.venv/
+
+# Local data / runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.backup_*
+*.old_*
+
+# Sensitive local config
+ai_config.json
+aiguanji_config.json
+wxwork_app_config.json
+webhook_config.json
+zhuanzhuan_accounts.json

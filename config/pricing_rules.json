@@ -1,0 +1,61 @@
+{
+  "rules": [
+    {
+      "name": "iPhone 极速动销",
+      "priority": 10,
+      "enabled": true,
+      "match": {
+        "model_contains": "iPhone"
+      },
+      "action": {
+        "type": "fast_price",
+        "adjust_pct": 0,
+        "amount": 0.0
+      },
+      "note": ""
+    },
+    {
+      "name": "华为旗舰保守定价",
+      "priority": 20,
+      "enabled": true,
+      "match": {
+        "model_contains": "Mate"
+      },
+      "action": {
+        "type": "conservative_price",
+        "adjust_pct": -2,
+        "amount": 0.0
+      },
+      "note": ""
+    },
+    {
+      "name": "滞销7天降阶",
+      "priority": 50,
+      "enabled": true,
+      "match": {
+        "stale_days_gte": 7,
+        "stale_days_lt": 14
+      },
+      "action": {
+        "type": "fixed_drop",
+        "adjust_pct": 0.0,
+        "amount": 100
+      },
+      "note": ""
+    },
+    {
+      "name": "滞销14天深降",
+      "priority": 51,
+      "enabled": true,
+      "match": {
+        "stale_days_gte": 14
+      },
+      "action": {
+        "type": "pct_drop",
+        "adjust_pct": 5,
+        "amount": 0.0
+      },
+      "note": ""
+    }
+  ]
+}
