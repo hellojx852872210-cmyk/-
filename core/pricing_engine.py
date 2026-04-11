@@ -197,9 +197,9 @@ class PricingEngine:
             else:
                 continue
 
-            floor_guard = result.cost_floor_price or result.floor_price
-            if floor_guard is not None and next_price < floor_guard:
-                next_price = floor_guard
+            market_floor = result.market_floor_price or result.floor_price
+            if market_floor is not None and next_price < market_floor:
+                next_price = market_floor
             if result.market_cap_price is not None and next_price > result.market_cap_price:
                 next_price = result.market_cap_price
 
