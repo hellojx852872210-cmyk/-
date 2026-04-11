@@ -106,12 +106,19 @@ class PricingEngine:
 
         conservative_price = self._blend_prices(short_anchor, conservative_base, primary_ratio=0.7)
         trend_adjust_pct = self._trend_adjust_pct(short_median, long_median)
+        market_floor_price = floor_price
+        market_base_price = self._blend_prices(conservative_price, fast_price, primary_ratio=0.6)
+        age_discount_factor = 1.0
+        age_adjusted_price = market_base_price
         recommended_seed = self._blend_prices(fast_price, conservative_price, primary_ratio=0.7)
         recommended = self._apply_trend_adjustment(recommended_seed, trend_adjust_pct)
         if recommended is None:
             recommended = conservative_price
         if recommended is not None and floor_price is not None:
             recommended = max(recommended, floor_price)
+        market_cap_price = self._blend_prices(short_median, long_median, primary_ratio=0.65)
+        if market_cap_price is None:
+            market_cap_price = max(v for v in (fast_price, conservative_price, recommended) if v is not None)
 
         settle_seed = self._blend_prices(fast_settle, short_settle or conservative_settle, primary_ratio=0.7)
         settle = self._apply_trend_adjustment(settle_seed, trend_adjust_pct)
@@ -153,6 +160,13 @@ class PricingEngine:
             fast_price=fast_price,
             conservative_price=conservative_price,
             floor_price=floor_price,
+            market_floor_price=market_floor_price,
+            cost_floor_price=None,
+            market_cap_price=market_cap_price,
+            market_base_price=market_base_price,
+            age_discount_factor=age_discount_factor,
+            age_adjusted_price=age_adjusted_price,
+            pre_rule_price=recommended,
             recommended_price=recommended,
             settle_price=settle,
             confidence=confidence,
@@ -183,8 +197,11 @@ class PricingEngine:
             else:
                 continue
 
-            if result.floor_price is not None and next_price < result.floor_price:
-                next_price = result.floor_price
+            floor_guard = result.cost_floor_price or result.floor_price
+            if floor_guard is not None and next_price < floor_guard:
+                next_price = floor_guard
+            if result.market_cap_price is not None and next_price > result.market_cap_price:
+                next_price = result.market_cap_price
 
             result.recommended_price = next_price
             result.settle_price = self.calc_settle_price(next_price)
@@ -192,13 +209,25 @@ class PricingEngine:
             return result
         return result
 
+
     @staticmethod
     def calc_settle_price(price: Optional[float]) -> Optional[float]:
         if price is None:
             return None
         fee_rate = getattr(cfg, "platform_fee_rate", PLATFORM_FEE_RATE)
         station_fee = getattr(cfg, "station_service_fee", STATION_SERVICE_FEE)
-        return round(price * (1 - fee_rate) - station_fee, 2)
+        return max(price * (1 - fee_rate) - station_fee, 0.0)
+
+    @staticmethod
+    def calc_price_from_settle_target(settle_target: Optional[float]) -> Optional[float]:
+        if settle_target is None:
+            return None
+        fee_rate = getattr(cfg, "platform_fee_rate", PLATFORM_FEE_RATE)
+        station_fee = getattr(cfg, "station_service_fee", STATION_SERVICE_FEE)
+        net_rate = 1 - fee_rate
+        if net_rate <= 0:
+            return None
+        return max((settle_target + station_fee) / net_rate, 0.0)
 
     def _record_weight(self, record: SoldRecord, now: datetime, allow_older: bool) -> int:
         days_ago = max((now - record.sold_time).total_seconds() / 86400, 0)
