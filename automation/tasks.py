@@ -5,9 +5,9 @@
 """
 from __future__ import annotations
 
-import copy
 import datetime
 import logging
+import uuid
 from typing import Callable, Optional
 
 from ..config import cfg
@@ -16,8 +16,17 @@ from ..core.models import BatchItem, PriceChangeRecord, PriceTrigger, ProductSta
 from ..core.price_history import get_history_db
 from ..core.pricing_engine import PricingEngine
 from ..core.rule_engine import RuleEngine
+from ..core.utils import round_to_8
 from ..services.data_store import AccountStore, CostPriceMap, SoldCache
 from ..services.erp_service import ErpConfig, ErpFetcher
+from ..services.reprice_service import (
+    assess_manual_review as _assess_manual_review,
+    build_reprice_decision,
+    clamp_price as _clamp_price,
+    pricing_preview as _pricing_preview,
+    recalc_decision_with_final_price,
+    run_reprice_pipeline,
+)
 from ..services.zhuanzhuan_api import DataFetcher, ImeiService
 
 logger = logging.getLogger(__name__)
@@ -27,6 +36,21 @@ def _log(msg: str, on_progress: Optional[Callable[[str], None]] = None) -> None:
     logger.info(msg)
     if on_progress:
         on_progress(msg)
+
+
+def _account_login_state(
+    svc: ImeiService,
+    account_name: str,
+    login_state_cache: dict[str, tuple[bool, str]],
+) -> tuple[bool, str]:
+    if account_name in login_state_cache:
+        return login_state_cache[account_name]
+    try:
+        ok, reason = svc.check_cookie_valid()
+    except Exception as exc:
+        ok, reason = False, str(exc)
+    login_state_cache[account_name] = (ok, reason)
+    return ok, reason
 
 
 def _refresh_imported_detail(svc: ImeiService, item: BatchItem):
@@ -55,6 +79,33 @@ def _estimate_suggested_settle_price(svc: ImeiService, product_id: str, price: f
         return None
 
 
+def _resolve_final_settle_price(
+    svc: ImeiService,
+    product_id: str,
+    final_price: Optional[float],
+    refreshed_detail=None,
+) -> Optional[float]:
+    refreshed_settle = getattr(refreshed_detail, "settle_price", None) if refreshed_detail is not None else None
+    if refreshed_settle is not None:
+        return float(refreshed_settle)
+    if product_id and final_price is not None:
+        estimated = _estimate_suggested_settle_price(svc, product_id, float(final_price))
+        if estimated is not None:
+            return estimated
+    if final_price is None:
+        return None
+    return PricingEngine.calc_settle_price(final_price)
+
+
+def _normalize_tail8_price(price: Optional[float]) -> Optional[float]:
+    if price is None:
+        return None
+    rounded = int(round(float(price), 0))
+    if rounded <= 0:
+        return 0.0
+    return float(round_to_8(rounded))
+
+
 def _status_detail_from_obj(obj) -> str:
     for value in (
         getattr(obj, "status_detail", ""),
@@ -76,257 +127,6 @@ def _iter_actionable_items(imported_store: BatchItemStore) -> list[BatchItem]:
         item for item in items
         if not getattr(item, "ignored", False) and getattr(item, "selected", True)
     ]
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _get_custom_reprice_config() -> dict:
-    mode = str(getattr(cfg, "auto_reprice_custom_offset_mode", "off") or "off").strip().lower()
-    if mode not in {"off", "fixed", "percent"}:
-        mode = "off"
-    value = _safe_float(getattr(cfg, "auto_reprice_custom_offset_value", 0.0), 0.0)
-    return {
-        "mode": mode,
-        "value": value,
-        "enabled": mode != "off" and abs(value) > 0,
-    }
-
-
-def _describe_custom_reprice_offset(mode: str, value: float) -> str:
-    if mode == "fixed":
-        return f"固定 {value:+.0f} 元"
-    if mode == "percent":
-        return f"比例 {value:+.1f}%"
-    return "关闭"
-
-
-def _apply_custom_reprice_offset(price: Optional[float], mode: str, value: float) -> Optional[float]:
-    if price is None:
-        return None
-    if mode == "fixed":
-        adjusted = price + value
-    elif mode == "percent":
-        adjusted = price * (1 + value / 100)
-    else:
-        adjusted = price
-    return max(round(adjusted, 0), 0)
-
-
-def _min_target_profit(cost_price: float) -> float:
-    if cost_price <= 0:
-        return 0.0
-    if cost_price < 1000:
-        return 40.0
-    if cost_price < 3000:
-        return max(cost_price * 0.03, 60.0)
-    return max(cost_price * 0.025, 100.0)
-
-
-def _cost_floor_price(cost_price: float) -> Optional[float]:
-    if cost_price <= 0:
-        return None
-    settle_target = cost_price + _min_target_profit(cost_price)
-    target_price = PricingEngine.calc_price_from_settle_target(settle_target)
-    if target_price is None:
-        return None
-    return round(target_price, 0)
-
-
-def _age_discount_factor(days_on_sale: int) -> float:
-    days = max(int(days_on_sale or 0), 0)
-    if days <= 3:
-        return 1.0
-    if days <= 15:
-        return max(1.0 - (days - 3) * 0.003, 0.85)
-    return max(1.0 - (12 * 0.003) - (days - 15) * 0.005, 0.7)
-
-
-def _clamp_price(price: Optional[float], floor_price: Optional[float], cap_price: Optional[float]) -> Optional[float]:
-    if price is None:
-        return None
-    value = float(price)
-    if floor_price is not None:
-        value = max(value, floor_price)
-    if cap_price is not None:
-        value = min(value, cap_price)
-    return round(value, 0)
-
-
-def _assess_manual_review(item: Optional[BatchItem], price: Optional[float], cost_floor: Optional[float]) -> dict:
-    settle_price = PricingEngine.calc_settle_price(price) if price is not None else None
-    cost_price = _safe_float(getattr(item, "cost_price", 0.0) if item is not None else 0.0, 0.0)
-    min_profit = _min_target_profit(cost_price) if cost_price > 0 else 0.0
-    target_settle = cost_price + min_profit if cost_price > 0 else None
-    below_cost = bool(cost_price > 0 and settle_price is not None and settle_price < cost_price)
-    below_target_profit = bool(target_settle is not None and settle_price is not None and settle_price < target_settle)
-    loss_amount = round(cost_price - settle_price, 0) if below_cost and settle_price is not None else 0.0
-    target_profit_gap = round(target_settle - settle_price, 0) if below_target_profit and target_settle is not None and settle_price is not None else 0.0
-    price_gap_to_cost_floor = round(cost_floor - price, 0) if cost_floor is not None and price is not None and price < cost_floor else 0.0
-
-    reason = ""
-    if below_cost and settle_price is not None:
-        reason = f"建议价预计到手 {settle_price:.0f} 低于成本 {cost_price:.0f}，需人工确认"
-    elif below_target_profit and settle_price is not None and target_settle is not None:
-        reason = f"建议价预计到手 {settle_price:.0f} 低于目标到手 {target_settle:.0f}"
-
-    return {
-        "settle_price": settle_price,
-        "cost_price": cost_price,
-        "target_settle": target_settle,
-        "below_cost": below_cost,
-        "below_target_profit": below_target_profit,
-        "needs_manual_review": below_cost,
-        "loss_amount": loss_amount,
-        "target_profit_gap": target_profit_gap,
-        "price_gap_to_cost_floor": price_gap_to_cost_floor,
-        "manual_review_reason": reason,
-    }
-
-
-def build_reprice_decision(
-    item: Optional[BatchItem],
-    pricing,
-    rule_engine: Optional[RuleEngine] = None,
-    *,
-    custom_mode: Optional[str] = None,
-    custom_value: Optional[float] = None,
-    apply_rules: bool = False,
-) -> dict:
-    config = _get_custom_reprice_config()
-    mode = str(custom_mode if custom_mode is not None else config["mode"] or "off").strip().lower()
-    if mode not in {"off", "fixed", "percent"}:
-        mode = "off"
-    value = _safe_float(custom_value if custom_value is not None else config["value"], 0.0)
-    custom_enabled = mode != "off" and abs(value) > 0
-
-    system_price = None
-    market_floor = None
-    market_cap = None
-    cost_floor = None
-    age_discount_factor = 1.0
-    age_adjusted_price = None
-    market_base_price = None
-    working_pricing = copy.deepcopy(pricing) if pricing is not None else None
-    if working_pricing is not None:
-        market_base_price = working_pricing.market_base_price
-        market_cap = working_pricing.market_cap_price
-        market_floor = working_pricing.market_floor_price or working_pricing.floor_price
-        if item is not None:
-            age_discount_factor = _age_discount_factor(item.days_on_sale)
-            if market_base_price is not None:
-                age_adjusted_price = round(market_base_price * age_discount_factor, 0)
-            cost_floor = _cost_floor_price(float(getattr(item, "cost_price", 0.0) or 0.0))
-        working_pricing.cost_floor_price = cost_floor
-        working_pricing.age_discount_factor = age_discount_factor
-        working_pricing.age_adjusted_price = age_adjusted_price
-        if market_base_price is not None:
-            working_pricing.market_base_price = market_base_price
-        base_candidate = age_adjusted_price if age_adjusted_price is not None else working_pricing.suggest_price()
-        base_candidate = _clamp_price(base_candidate, market_floor, market_cap)
-        working_pricing.pre_rule_price = base_candidate
-        working_pricing.recommended_price = base_candidate
-        working_pricing.settle_price = PricingEngine.calc_settle_price(base_candidate) if base_candidate is not None else None
-        if apply_rules and rule_engine is not None and item is not None:
-            system_price = rule_engine.apply(item, working_pricing) or working_pricing.suggest_price()
-        else:
-            system_price = working_pricing.suggest_price()
-    system_price = _clamp_price(system_price, market_floor, market_cap)
-    if working_pricing is not None:
-        working_pricing.recommended_price = system_price
-        working_pricing.settle_price = PricingEngine.calc_settle_price(system_price) if system_price is not None else None
-
-    final_price = _apply_custom_reprice_offset(system_price, mode, value)
-    final_price = _clamp_price(final_price, market_floor, market_cap)
-    manual_review = _assess_manual_review(item, final_price, cost_floor)
-    explain_lines = []
-    if market_base_price is not None:
-        explain_lines.append(f"市场基准 {market_base_price:.0f}")
-    if age_adjusted_price is not None and age_discount_factor != 1.0:
-        explain_lines.append(f"库龄系数 {age_discount_factor:.3f} -> {age_adjusted_price:.0f}")
-    if cost_floor is not None:
-        explain_lines.append(f"成本底线 {cost_floor:.0f}")
-    if market_cap is not None:
-        explain_lines.append(f"市场上限 {market_cap:.0f}")
-    if manual_review["needs_manual_review"]:
-        explain_lines.append(f"低于成本需人工确认，预计亏损 {manual_review['loss_amount']:.0f}")
-    elif manual_review["below_target_profit"] and manual_review["target_profit_gap"] > 0:
-        explain_lines.append(f"低于目标利润 {manual_review['target_profit_gap']:.0f}")
-    if rule_engine is not None and item is not None and working_pricing is not None:
-        explain_lines.extend([line for line in rule_engine.explain(item, working_pricing) if line])
-
-    return {
-        "pricing": working_pricing,
-        "system_price": system_price,
-        "system_settle_price": PricingEngine.calc_settle_price(system_price) if system_price is not None else None,
-        "final_price": final_price,
-        "final_settle_price": manual_review["settle_price"],
-        "custom_mode": mode,
-        "custom_value": value,
-        "custom_enabled": custom_enabled,
-        "custom_summary": _describe_custom_reprice_offset(mode, value),
-        "rule_hit": getattr(working_pricing, "rule_hit", "") if working_pricing is not None else "",
-        "floor_guard": market_floor,
-        "market_floor": market_floor,
-        "market_cap": market_cap,
-        "cost_floor": cost_floor,
-        "age_discount_factor": age_discount_factor,
-        "age_adjusted_price": age_adjusted_price,
-        "market_base_price": market_base_price,
-        "below_cost": manual_review["below_cost"],
-        "below_target_profit": manual_review["below_target_profit"],
-        "needs_manual_review": manual_review["needs_manual_review"],
-        "manual_review_reason": manual_review["manual_review_reason"],
-        "loss_amount": manual_review["loss_amount"],
-        "target_profit_gap": manual_review["target_profit_gap"],
-        "price_gap_to_cost_floor": manual_review["price_gap_to_cost_floor"],
-        "target_settle": manual_review["target_settle"],
-        "cost_price": manual_review["cost_price"],
-        "explain_lines": explain_lines,
-    }
-
-
-def _pricing_preview(pricing, rule_engine: Optional[RuleEngine] = None, item: Optional[BatchItem] = None, decision: Optional[dict] = None) -> str:
-    if pricing is None:
-        return "无定价结果"
-    if decision is None:
-        decision = build_reprice_decision(item, pricing, rule_engine, apply_rules=True)
-    parts = [
-        f"样本 {pricing.sample_count}",
-        f"精确 {pricing.exact_sample_count}",
-        f"补充 {pricing.fallback_sample_count}",
-        f"极速价 {pricing.fast_price:.0f}" if pricing.fast_price is not None else "极速价 -",
-        f"保守价 {pricing.conservative_price:.0f}" if pricing.conservative_price is not None else "保守价 -",
-        f"市场底 {pricing.market_floor_price:.0f}" if pricing.market_floor_price is not None else (f"底价 {pricing.floor_price:.0f}" if pricing.floor_price is not None else "底价 -"),
-        f"市场基准 {decision['market_base_price']:.0f}" if decision.get("market_base_price") is not None else "市场基准 -",
-        f"库龄后 {decision['age_adjusted_price']:.0f}" if decision.get("age_adjusted_price") is not None else "库龄后 -",
-        f"成本底线 {decision['cost_floor']:.0f}" if decision.get("cost_floor") is not None else "成本底线 -",
-        f"系统建议价 {decision['system_price']:.0f}" if decision.get("system_price") is not None else "系统建议价 -",
-        f"最终执行价 {decision['final_price']:.0f}" if decision.get("final_price") is not None else "最终执行价 -",
-        f"自定义 {decision['custom_summary']}",
-        f"预计到手 {decision['final_settle_price']:.0f}" if decision.get("final_settle_price") is not None else "预计到手 -",
-        f"置信度 {getattr(pricing.confidence, 'value', pricing.confidence) or '-'}",
-    ]
-    if decision.get("needs_manual_review"):
-        parts.append("需人工确认")
-        if decision.get("loss_amount"):
-            parts.append(f"预计亏损 {decision['loss_amount']:.0f}")
-        if decision.get("manual_review_reason"):
-            parts.append(f"原因 {decision['manual_review_reason']}")
-    elif decision.get("below_target_profit") and decision.get("target_profit_gap"):
-        parts.append(f"低于目标利润 {decision['target_profit_gap']:.0f}")
-    if pricing.rule_hit:
-        parts.append(f"规则 {pricing.rule_hit}")
-    if pricing.warning:
-        parts.append(f"提示 {pricing.warning}")
-    explain_lines = decision.get("explain_lines") or []
-    if explain_lines:
-        parts.append("逻辑 " + " | ".join(explain_lines[:4]))
-    return "；".join(parts)
 
 
 def _normalize_lookup_code(value) -> str:
@@ -364,107 +164,291 @@ def _detail_lookup_codes(detail) -> list[str]:
     return codes
 
 
-def _query_detail_for_lookup_code(svc: ImeiService, code: str):
+def _sample_codes(codes: list[str], limit: int = 5) -> str:
+    values = [code for code in codes if code]
+    if not values:
+        return "-"
+    sample = values[:limit]
+    suffix = " ..." if len(values) > limit else ""
+    return ", ".join(sample) + suffix
+
+
+def _format_erp_item_identity(erp_item) -> str:
+    return (
+        f"product_id={getattr(erp_item, 'product_id', '') or '-'} "
+        f"qc={getattr(erp_item, 'qc_code', '') or '-'} "
+        f"imei={getattr(erp_item, 'imei', '') or '-'}"
+    )
+
+
+def _erp_code_stats(erp_items) -> dict[str, object]:
+    total_items = len(erp_items or [])
+    qc_count = 0
+    imei_count = 0
+    no_code_count = 0
+    raw_lookup_count = 0
+    unique_codes: list[str] = []
+    seen: set[str] = set()
+    sample_items: list[str] = []
+
+    for erp_item in erp_items or []:
+        qc_code = _normalize_lookup_code(getattr(erp_item, "qc_code", ""))
+        imei = _normalize_lookup_code(getattr(erp_item, "imei", ""))
+        if qc_code:
+            qc_count += 1
+        if imei:
+            imei_count += 1
+        item_codes = _erp_item_lookup_codes(erp_item)
+        if not item_codes:
+            no_code_count += 1
+            if len(sample_items) < 5:
+                sample_items.append(_format_erp_item_identity(erp_item))
+            continue
+        raw_lookup_count += len(item_codes)
+        for code in item_codes:
+            if code in seen:
+                continue
+            seen.add(code)
+            unique_codes.append(code)
+
+    return {
+        "total_items": total_items,
+        "qc_count": qc_count,
+        "imei_count": imei_count,
+        "no_code_count": no_code_count,
+        "raw_lookup_count": raw_lookup_count,
+        "unique_lookup_count": len(unique_codes),
+        "sample_codes": _sample_codes(unique_codes),
+        "sample_no_code_items": sample_items,
+    }
+
+
+def _query_detail_for_lookup_code(
+    svc: ImeiService,
+    code: str,
+    lookup_cache: Optional[dict[str, tuple[Optional[object], str]]] = None,
+) -> tuple[Optional[object], str]:
     normalized = _normalize_lookup_code(code)
     if not normalized:
-        return None
+        return None, "lookup code 为空"
+    if lookup_cache is not None and normalized in lookup_cache:
+        return lookup_cache[normalized]
     query_methods: list[Callable[[str], Optional[object]]] = []
     if normalized.isdigit() and len(normalized) == 15:
         query_methods.extend([svc.query_by_imei, svc.query_by_qc_code])
     else:
         query_methods.extend([svc.query_by_qc_code, svc.query_by_imei])
+    errors: list[str] = []
     for query in query_methods:
         try:
             detail = query(normalized)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"{query.__name__}: {exc}")
             detail = None
         if detail is None:
             continue
         lookup_codes = set(getattr(detail, "_lookup_codes", []) or [])
         lookup_codes.add(normalized)
         setattr(detail, "_lookup_codes", tuple(lookup_codes))
-        return detail
-    return None
+        result = (detail, "")
+        if lookup_cache is not None:
+            lookup_cache[normalized] = result
+        return result
+    result = (None, "；".join(errors))
+    if lookup_cache is not None:
+        lookup_cache[normalized] = result
+    return result
 
 
-def _match_detail_for_erp_item(svc: ImeiService, erp_item, detail_by_code: dict[str, object]):
-    for code in _erp_item_lookup_codes(erp_item):
+def _match_detail_for_erp_item(
+    svc: ImeiService,
+    erp_item,
+    detail_by_code: dict[str, object],
+    missing_codes: Optional[set[str]] = None,
+    lookup_cache: Optional[dict[str, tuple[Optional[object], str]]] = None,
+) -> tuple[Optional[object], str]:
+    codes = _erp_item_lookup_codes(erp_item)
+    if not codes:
+        return None, "ERP 商品缺少质检码/IMEI"
+
+    for code in codes:
         detail = detail_by_code.get(code)
         if detail is not None:
-            return detail
+            return detail, f"批量结果命中 {code}"
 
-    for code in _erp_item_lookup_codes(erp_item):
-        detail = _query_detail_for_lookup_code(svc, code)
+    missing_hits = [code for code in codes if code in (missing_codes or set())]
+    if missing_hits and len(missing_hits) == len(codes):
+        return None, f"批量接口未返回 {', '.join(missing_hits)}；未找到 lookup code: {', '.join(codes)}"
+
+    fallback_errors: list[str] = []
+    for code in codes:
+        detail, error = _query_detail_for_lookup_code(svc, code, lookup_cache=lookup_cache)
         if detail is None:
+            if error:
+                fallback_errors.append(f"{code} => {error}")
             continue
         for detail_code in _detail_lookup_codes(detail):
             detail_by_code.setdefault(detail_code, detail)
         detail_by_code.setdefault(code, detail)
-        return detail
-    return None
+        return detail, f"单条兜底命中 {code}"
+
+    reason_parts: list[str] = []
+    if missing_hits:
+        reason_parts.append(f"批量接口未返回 {', '.join(missing_hits)}")
+    if fallback_errors:
+        reason_parts.append(f"单条查询异常 { ' | '.join(fallback_errors) }")
+    reason_parts.append(f"未找到 lookup code: {', '.join(codes)}")
+    return None, "；".join(reason_parts)
+
+
+
+
+def _is_listing_eligible(item: Optional[BatchItem]) -> bool:
+    return bool(getattr(item, "listing_eligible", False))
+
+
+def _allowed_listing_import_sources() -> set[str]:
+    return {"manual", "erp"}
+
+
+def _listing_skip_reason(item: Optional[BatchItem]) -> str:
+    source = str(getattr(item, "import_source", "") or "").strip().lower()
+    if getattr(item, "ignored", False):
+        return "商品在不处理区"
+    if not getattr(item, "selected", True):
+        return "商品未勾选参与自动化"
+    if source not in _allowed_listing_import_sources():
+        return f"导入来源不支持自动上架：{source or '-'}"
+    if getattr(item, "status", None) != ProductStatus.NOT_LISTED:
+        status = getattr(getattr(item, "status", None), "label", "未知状态")
+        return f"当前状态非未上架：{status}"
+    if not _is_listing_eligible(item):
+        return "商品未标记为可自动上架"
+    return ""
+
+
+def _manual_review_fields(decision: Optional[dict]) -> dict:
+    data = decision or {}
+    return {
+        "needs_manual_review": bool(data.get("needs_manual_review")),
+        "manual_review_reason": str(data.get("manual_review_reason") or ""),
+    }
 
 
 def _build_imported_batch_item(detail, account_name: str, erp_item) -> BatchItem:
-    qc_code = _normalize_lookup_code(getattr(detail, "qc_code", "")) or _normalize_lookup_code(getattr(erp_item, "qc_code", ""))
-    imei = _normalize_lookup_code(getattr(detail, "imei", "")) or _normalize_lookup_code(getattr(erp_item, "imei", ""))
-    return BatchItem(
-        product_id=detail.product_id,
-        qc_code=qc_code or imei,
-        title=detail.title,
-        current_price=detail.current_price,
-        status=detail.status,
-        status_detail=_status_detail_from_obj(detail),
+    status_detail = _status_detail_from_obj(detail)
+    item = BatchItem(
+        product_id=str(getattr(detail, "product_id", "") or getattr(erp_item, "product_id", "") or ""),
+        qc_code=str(getattr(detail, "qc_code", "") or getattr(erp_item, "qc_code", "") or ""),
+        title=str(getattr(detail, "title", "") or getattr(erp_item, "title", "") or ""),
+        current_price=float(getattr(detail, "current_price", 0.0) or 0.0),
+        status=getattr(detail, "status", ProductStatus.UNKNOWN),
+        status_detail=status_detail,
         account_name=account_name,
-        imei=imei,
-        model=detail.model,
-        condition=detail.condition,
-        capacity=detail.capacity,
-        color=detail.color,
-        cost_price=0.0,
-        listed_time=detail.listed_time,
-        settle_price=detail.settle_price,
-        op_status="已导入",
-        op_message="ERP 同步导入",
+        imei=str(getattr(detail, "imei", "") or getattr(erp_item, "imei", "") or ""),
+        model=str(getattr(detail, "model", "") or ""),
+        condition=str(getattr(detail, "condition", "") or ""),
+        capacity=str(getattr(detail, "capacity", "") or ""),
+        color=str(getattr(detail, "color", "") or ""),
+        cost_price=float(getattr(erp_item, "cost_price", 0.0) or 0.0),
+        listed_time=getattr(detail, "listed_time", None) or getattr(erp_item, "listed_time", None),
+        settle_price=float(getattr(detail, "settle_price", 0.0) or 0.0),
+        import_source="erp",
+        listing_eligible=getattr(detail, "status", None) == ProductStatus.NOT_LISTED,
     )
+    item.op_status = "待处理"
+    item.op_message = status_detail
+    return item
 
 
-def _match_erp_items_for_account(account, erp_items, on_progress: Optional[Callable[[str], None]] = None) -> tuple[list[tuple[object, BatchItem]], list[object], bool]:
+def _match_erp_items_for_account(
+    account,
+    erp_items,
+    on_progress: Optional[Callable[[str], None]] = None,
+    *,
+    run_id: str,
+) -> tuple[list[tuple[object, BatchItem]], list[object], bool]:
     if not erp_items:
         return [], [], False
 
     svc = ImeiService(account.name, account.cookie)
+    stats = _erp_code_stats(erp_items)
+    _log(
+        f"[ERP_SYNC:{run_id}] [{account.name}] 开始账号匹配：ERP商品 {stats['total_items']} 件，"
+        f"qc {stats['qc_count']} 件，imei {stats['imei_count']} 件，无code {stats['no_code_count']} 件，"
+        f"lookup原始 {stats['raw_lookup_count']} 个，去重后 {stats['unique_lookup_count']} 个，样例 {stats['sample_codes']}",
+        on_progress,
+    )
+    if stats["sample_no_code_items"]:
+        for item_desc in stats["sample_no_code_items"]:
+            _log(f"[ERP_SYNC:{run_id}] [{account.name}] 无lookup code样例：{item_desc}", on_progress)
+
     lookup_codes: list[str] = []
     for erp_item in erp_items:
         lookup_codes.extend(_erp_item_lookup_codes(erp_item))
 
     if not lookup_codes:
+        _log(f"[ERP_SYNC:{run_id}] [{account.name}] 跳过批量匹配：本账号 ERP 商品均未提取到 lookup code", on_progress)
         return [], list(erp_items), False
 
     try:
-        details, _missing = svc.fetch_by_codes(lookup_codes)
+        details, missing = svc.fetch_by_codes(lookup_codes, batch_size=20)
+        _log(
+            f"[ERP_SYNC:{run_id}] [{account.name}] 批量匹配返回：明细 {len(details)} 件，缺失code {len(missing or [])} 个",
+            on_progress,
+        )
     except Exception as e:
-        _log(f"[{account.name}] 批量匹配失败: {e}", on_progress)
+        _log(f"[ERP_SYNC:{run_id}] [{account.name}] 批量匹配失败: {e}", on_progress)
         return [], list(erp_items), True
 
+    missing_codes = set(missing or [])
     detail_by_code: dict[str, object] = {}
+    lookup_cache: dict[str, tuple[Optional[object], str]] = {}
     for detail in details:
         for code in _detail_lookup_codes(detail):
             detail_by_code.setdefault(code, detail)
 
     matched: list[tuple[object, BatchItem]] = []
     unresolved: list[object] = []
-    for erp_item in erp_items:
-        detail = None
-        for code in _erp_item_lookup_codes(erp_item):
-            detail = detail_by_code.get(code)
-            if detail is not None:
-                break
+    unresolved_logs: list[str] = []
+    progress_step = 50 if len(erp_items) >= 200 else 20 if len(erp_items) >= 80 else 10 if len(erp_items) >= 20 else 1
+    for index, erp_item in enumerate(erp_items, start=1):
+        if index == 1 or index == len(erp_items) or index % progress_step == 0:
+            _log(
+                f"[ERP_SYNC:{run_id}] [{account.name}] 正在整理匹配结果 {index}/{len(erp_items)}，"
+                f"当前已匹配 {len(matched)}，待确认 {len(unresolved)}",
+                on_progress,
+            )
+        detail, reason = _match_detail_for_erp_item(svc, erp_item, detail_by_code, missing_codes=missing_codes, lookup_cache=lookup_cache)
         if detail is None:
             unresolved.append(erp_item)
+            codes = ", ".join(_erp_item_lookup_codes(erp_item)) or "-"
+            unresolved_logs.append(
+                f"[ERP_SYNC:{run_id}] [{account.name}] 未匹配 ERP 商品"
+                f" product_id={getattr(erp_item, 'product_id', '') or '-'}"
+                f" qc={getattr(erp_item, 'qc_code', '') or '-'}"
+                f" imei={getattr(erp_item, 'imei', '') or '-'}"
+                f" lookup={codes}"
+                f" 原因={reason or '未知'}"
+            )
             continue
         matched.append((erp_item, _build_imported_batch_item(detail, account.name, erp_item)))
 
+    _log(
+        f"[ERP_SYNC:{run_id}] [{account.name}] 账号匹配结束：匹配 {len(matched)} 件，未匹配 {len(unresolved)} 件，"
+        f"detail_by_code {len(detail_by_code)} 个，missing_code {len(missing_codes)} 个",
+        on_progress,
+    )
+    if unresolved_logs:
+        preview_count = min(20, len(unresolved_logs))
+        for line in unresolved_logs[:preview_count]:
+            _log(line, on_progress)
+        remaining = len(unresolved_logs) - preview_count
+        if remaining > 0:
+            _log(f"[ERP_SYNC:{run_id}] [{account.name}] 其余未匹配明细省略 {remaining} 条，请按上面样例继续排查", on_progress)
+
     return matched, unresolved, False
+
 
 
 # ─── 任务0：ERP 同步 ─────────────────────────────────────────
@@ -479,27 +463,46 @@ def task_erp_sync(
     """
     同步 ERP 商品到本地成本价映射，并通过质检码/IMEI 匹配转转商品。
     """
+    run_id = uuid.uuid4().hex[:8]
     try:
         fetcher = ErpFetcher(erp_config)
-        _log("开始从爱管机 ERP 拉取商品...", on_progress)
+        existing_count_before = imported_store.count() if imported_store is not None else 0
+        accounts = account_store.enabled_accounts()
+        _log(
+            f"[ERP_SYNC:{run_id}] 开始同步：账号 {len(accounts)} 个，商品管理现有 {existing_count_before} 件",
+            on_progress,
+        )
+        _log(f"[ERP_SYNC:{run_id}] 开始从爱管机 ERP 拉取商品...", on_progress)
         fetcher.check_and_refresh_token()
 
         on_sale_erp = fetcher.fetch_on_sale_items()
         in_stock_erp = fetcher.fetch_in_stock_items()
         all_erp = on_sale_erp + in_stock_erp
-        _log(f"ERP 商品拉取完成：上架 {len(on_sale_erp)} 件，在库 {len(in_stock_erp)} 件", on_progress)
+        _log(
+            f"[ERP_SYNC:{run_id}] ERP 商品拉取完成：上架 {len(on_sale_erp)} 件，在库 {len(in_stock_erp)} 件，合计 {len(all_erp)} 件",
+            on_progress,
+        )
+
+        erp_stats = _erp_code_stats(all_erp)
+        _log(
+            f"[ERP_SYNC:{run_id}] ERP 字段统计：qc {erp_stats['qc_count']} 件，imei {erp_stats['imei_count']} 件，"
+            f"无code {erp_stats['no_code_count']} 件，lookup原始 {erp_stats['raw_lookup_count']} 个，"
+            f"去重后 {erp_stats['unique_lookup_count']} 个，样例 {erp_stats['sample_codes']}",
+            on_progress,
+        )
+        if erp_stats["sample_no_code_items"]:
+            for item_desc in erp_stats["sample_no_code_items"]:
+                _log(f"[ERP_SYNC:{run_id}] 无lookup code样例：{item_desc}", on_progress)
 
         cost_data = fetcher.build_cost_map(all_erp)
         cost_map.update(cost_data)
-        _log(f"已同步成本价 {len(cost_data)} 条", on_progress)
+        _log(f"[ERP_SYNC:{run_id}] 已同步成本价 {len(cost_data)} 条", on_progress)
 
-        accounts = account_store.enabled_accounts()
         if not accounts:
-            existing_count = imported_store.count() if imported_store is not None else 0
             summary = f"已同步成本价 {len(cost_data)} 条，无可用转转账号，未执行导入"
             if imported_store is not None:
-                summary += f"，商品管理保留现有 {existing_count} 件"
-            _log(summary, on_progress)
+                summary += f"，商品管理保留现有 {existing_count_before} 件"
+            _log(f"[ERP_SYNC:{run_id}] {summary}", on_progress)
             return {
                 "items": [],
                 "summary": summary,
@@ -516,13 +519,14 @@ def task_erp_sync(
         total_items = len(all_erp)
         progress_step = 10 if total_items >= 100 else 5 if total_items >= 30 else 1
 
-        _log(f"开始批量匹配 ERP 商品到转转，共 {total_items} 件，账号 {len(accounts)} 个...", on_progress)
+        _log(f"[ERP_SYNC:{run_id}] 开始批量匹配 ERP 商品到转转，共 {total_items} 件，账号 {len(accounts)} 个...", on_progress)
 
         unmatched_items = list(all_erp)
         for account in accounts:
             if not unmatched_items:
                 break
-            matched_pairs, unresolved, had_error = _match_erp_items_for_account(account, unmatched_items, on_progress)
+            _log(f"[ERP_SYNC:{run_id}] [{account.name}] 准备匹配：当前待匹配 ERP 商品 {len(unmatched_items)} 件", on_progress)
+            matched_pairs, unresolved, had_error = _match_erp_items_for_account(account, unmatched_items, on_progress, run_id=run_id)
             if had_error:
                 error_accounts.append(account.name)
             for erp_item, matched_item in matched_pairs:
@@ -534,13 +538,15 @@ def task_erp_sync(
             completed = total_items - len(unmatched_items)
             if total_items and (completed == total_items or completed % progress_step == 0):
                 _log(
-                    f"[{account.name}] 已匹配 {completed}/{total_items} 件 ERP 商品，成功 {len(matched_items)}，未找到 {len(unmatched_items)}...",
+                    f"[ERP_SYNC:{run_id}] [{account.name}] 已匹配 {completed}/{total_items} 件 ERP 商品，成功 {len(matched_items)}，未找到 {len(unmatched_items)}...",
                     on_progress,
                 )
 
         missed = len(unmatched_items)
+        updated_count = 0
+        inserted_count = 0
+        existing_count_after = existing_count_before
         if imported_store is not None:
-            # 与手动导入行为对齐：更新已存在商品，追加新商品，而不是整体覆盖
             existing_items = imported_store.get_all()
             existing_ids = {it.product_id for it in existing_items}
             new_items: list[BatchItem] = []
@@ -565,17 +571,25 @@ def task_erp_sync(
                         settle_price=matched_item.settle_price,
                         cost_price=matched_item.cost_price,
                     )
+                    updated_count += 1
                 else:
                     new_items.append(matched_item)
             if new_items:
                 imported_store.extend(new_items)
+                inserted_count = len(new_items)
+            existing_count_after = imported_store.count()
+            _log(
+                f"[ERP_SYNC:{run_id}] 商品管理写入完成：更新 {updated_count} 件，新增 {inserted_count} 件，"
+                f"导入前 {existing_count_before} 件，导入后 {existing_count_after} 件",
+                on_progress,
+            )
 
         summary = f"同步成本价 {len(cost_data)} 条，匹配 {len(matched_items)} 件，未找到 {missed} 件"
         if imported_store is not None:
-            summary += f"，已导入商品管理 {len(matched_items)} 件"
+            summary += f"，已导入商品管理 {existing_count_after} 件"
         if error_accounts:
             summary += f"（以下店铺匹配接口报错已跳过：{', '.join(error_accounts)}）"
-        _log(summary, on_progress)
+        _log(f"[ERP_SYNC:{run_id}] {summary}", on_progress)
         return {
             "items": matched_items,
             "summary": summary,
@@ -586,6 +600,7 @@ def task_erp_sync(
         }
     except Exception as e:
         logger.exception("ERP 同步失败")
+        _log(f"[ERP_SYNC:{run_id}] 同步失败: {e}", on_progress)
         return {
             "items": [],
             "summary": str(e),
@@ -606,7 +621,6 @@ def task_auto_reprice(
     imported_store: BatchItemStore,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    engine = PricingEngine()
     history_db = get_history_db()
     accounts = {account.name: account for account in account_store.enabled_accounts()}
     items = _iter_actionable_items(imported_store)
@@ -617,6 +631,7 @@ def task_auto_reprice(
         return {"total": 0, "ok": 0, "skip": 0, "fail": 0}
 
     services: dict[str, ImeiService] = {}
+    login_state_cache: dict[str, tuple[bool, str]] = {}
     for item in items:
         total += 1
         account = accounts.get(item.account_name)
@@ -636,6 +651,20 @@ def task_auto_reprice(
         if svc is None:
             svc = ImeiService(account.name, account.cookie)
             services[account.name] = svc
+
+        login_ok, login_reason = _account_login_state(svc, account.name, login_state_cache)
+        if not login_ok:
+            reason_text = str(login_reason or "登录状态过期，请重新登录").strip()
+            imported_store.update_item(
+                item.product_id,
+                reprice_ok=False,
+                reprice_msg=f"账号登录失效：{reason_text}",
+                op_status="失败",
+                op_message=f"自动调价跳过：账号登录失效（{reason_text}）",
+            )
+            _log(f"[{account.name}] [{item.qc_code or item.product_id}] 跳过: 账号登录失效（{reason_text}）", on_progress)
+            fail += 1
+            continue
 
         try:
             detail = _refresh_imported_detail(svc, item)
@@ -663,21 +692,37 @@ def task_auto_reprice(
             fail += 1
             continue
 
-        current_cost = cost_map.get(detail.product_id) or item.cost_price
-        imported_store.update_item(
-            item.product_id,
+        work_item = BatchItem(
+            product_id=detail.product_id,
             qc_code=detail.qc_code or item.qc_code,
             title=detail.title,
+            current_price=detail.current_price,
+            status=detail.status,
+            account_name=account.name,
+            imei=getattr(detail, "imei", "") or getattr(item, "imei", ""),
             model=detail.model,
             condition=detail.condition,
             capacity=detail.capacity,
             color=detail.color,
-            current_price=detail.current_price,
-            status=detail.status,
-            status_detail=_status_detail_from_obj(detail),
+            cost_price=cost_map.get(detail.product_id) or item.cost_price,
             listed_time=detail.listed_time,
             settle_price=detail.settle_price,
-            cost_price=current_cost,
+        )
+        imported_store.update_item(
+            item.product_id,
+            qc_code=work_item.qc_code,
+            title=work_item.title,
+            model=work_item.model,
+            condition=work_item.condition,
+            capacity=work_item.capacity,
+            color=work_item.color,
+            current_price=work_item.current_price,
+            status=work_item.status,
+            status_detail=_status_detail_from_obj(detail),
+            listed_time=work_item.listed_time,
+            settle_price=work_item.settle_price,
+            cost_price=work_item.cost_price,
+            imei=work_item.imei,
         )
 
         if detail.status != ProductStatus.ON_SALE:
@@ -692,35 +737,27 @@ def task_auto_reprice(
             skip += 1
             continue
 
-        records = sold_cache.filter_by_model_key(detail.model, detail.condition, detail.capacity, detail.color)
-        pricing = engine.calculate(records, detail.model, detail.condition, detail.capacity, detail.color)
-        work_item = BatchItem(
-            product_id=detail.product_id,
-            qc_code=detail.qc_code or item.qc_code,
-            title=detail.title,
-            current_price=detail.current_price,
-            status=detail.status,
-            account_name=account.name,
-            model=detail.model,
-            condition=detail.condition,
-            capacity=detail.capacity,
-            color=detail.color,
-            cost_price=current_cost,
-            listed_time=detail.listed_time,
-            pricing=pricing,
+        pipeline = run_reprice_pipeline(
+            work_item,
+            sold_cache,
+            rule_engine,
+            apply_rules=True,
+            settle_price_estimator=lambda price, product_id=detail.product_id: _estimate_suggested_settle_price(svc, product_id, price),
         )
-        decision = build_reprice_decision(work_item, pricing, rule_engine, apply_rules=True)
+        pricing = pipeline["pricing"]
+        decision = pipeline["decision"]
+        preview = pipeline["preview"]
         system_price = decision.get("system_price")
-        new_price = decision["final_price"]
-        preview = _pricing_preview(pricing, rule_engine, work_item, decision)
+        new_price = pipeline["suggested_price"]
+        suggested_settle = pipeline.get("suggested_settle_price")
         imported_store.update_item(
             item.product_id,
             pricing=pricing,
             suggested_price=new_price,
             new_price=new_price,
-            floor_price=pricing.floor_price,
-            suggested_settle_price=decision.get("final_settle_price"),
-            confidence=getattr(pricing.confidence, "value", pricing.confidence),
+            floor_price=pricing.floor_price if pricing is not None else None,
+            suggested_settle_price=suggested_settle,
+            confidence=getattr(pricing.confidence, "value", pricing.confidence) if pricing is not None else "",
             rule_hit=decision.get("rule_hit", ""),
         )
 
@@ -755,7 +792,7 @@ def task_auto_reprice(
             skip += 1
             continue
 
-        new_price = round(new_price, 0)
+        new_price = _normalize_tail8_price(new_price)
         suggested_settle = _estimate_suggested_settle_price(svc, detail.product_id, float(new_price))
         imported_store.update_item(
             item.product_id,
@@ -778,18 +815,19 @@ def task_auto_reprice(
         success, msg = svc.change_price(detail, new_price)
         if success:
             ok += 1
-            settle = PricingEngine.calc_settle_price(new_price)
             refreshed = _refresh_imported_detail(svc, item)
+            record_source = refreshed or detail
+            settle = _resolve_final_settle_price(svc, detail.product_id, new_price, refreshed)
             history_db.record(PriceChangeRecord(
                 id=None,
                 timestamp=datetime.datetime.now(),
                 product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
+                qc_code=getattr(record_source, "qc_code", detail.qc_code) or item.qc_code,
+                title=getattr(record_source, "title", detail.title),
+                model=getattr(record_source, "model", detail.model),
+                condition=getattr(record_source, "condition", detail.condition),
+                capacity=getattr(record_source, "capacity", detail.capacity),
+                color=getattr(record_source, "color", detail.color),
                 old_price=detail.current_price,
                 new_price=new_price,
                 diff=new_price - detail.current_price,
@@ -808,9 +846,9 @@ def task_auto_reprice(
                 capacity=getattr(refreshed, "capacity", detail.capacity),
                 color=getattr(refreshed, "color", detail.color),
                 current_price=getattr(refreshed, "current_price", new_price),
-                settle_price=getattr(refreshed, "settle_price", settle) or settle,
+                settle_price=settle,
                 suggested_price=new_price,
-                suggested_settle_price=getattr(refreshed, "settle_price", settle) or settle,
+                suggested_settle_price=settle,
                 listed_time=getattr(refreshed, "listed_time", detail.listed_time),
                 status=getattr(refreshed, "status", detail.status),
                 status_detail=_status_detail_from_obj(refreshed or detail),
@@ -848,7 +886,6 @@ def task_stale_drop(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     history_db = get_history_db()
-    engine = PricingEngine()
     accounts = {account.name: account for account in account_store.enabled_accounts()}
     items = _iter_actionable_items(imported_store)
     total = ok = skip = fail = 0
@@ -861,6 +898,7 @@ def task_stale_drop(
     stage2 = cfg.stale_stage2_days
     drop_pct = cfg.stale_stage2_drop_pct
     services: dict[str, ImeiService] = {}
+    login_state_cache: dict[str, tuple[bool, str]] = {}
 
     for item in items:
         total += 1
@@ -881,6 +919,20 @@ def task_stale_drop(
         if svc is None:
             svc = ImeiService(account.name, account.cookie)
             services[account.name] = svc
+
+        login_ok, login_reason = _account_login_state(svc, account.name, login_state_cache)
+        if not login_ok:
+            reason_text = str(login_reason or "登录状态过期，请重新登录").strip()
+            imported_store.update_item(
+                item.product_id,
+                reprice_ok=False,
+                reprice_msg=f"账号登录失效：{reason_text}",
+                op_status="失败",
+                op_message=f"滞销任务跳过：账号登录失效（{reason_text}）",
+            )
+            _log(f"[{account.name}] [{item.qc_code or item.product_id}] 跳过: 账号登录失效（{reason_text}）", on_progress)
+            fail += 1
+            continue
 
         try:
             detail = _refresh_imported_detail(svc, item)
@@ -959,30 +1011,7 @@ def task_stale_drop(
             skip += 1
             continue
 
-        records = sold_cache.filter_by_model_key(detail.model, detail.condition, detail.capacity, detail.color)
-        pricing = engine.calculate(records, detail.model, detail.condition, detail.capacity, detail.color)
-        decision = build_reprice_decision(
-            BatchItem(
-                product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                current_price=detail.current_price,
-                status=detail.status,
-                account_name=account.name,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
-                cost_price=item.cost_price,
-                listed_time=detail.listed_time,
-                settle_price=detail.settle_price,
-                pricing=pricing,
-            ),
-            pricing,
-            rule_engine,
-            apply_rules=True,
-        )
-        preview = _pricing_preview(pricing, rule_engine, BatchItem(
+        work_item = BatchItem(
             product_id=detail.product_id,
             qc_code=detail.qc_code or item.qc_code,
             title=detail.title,
@@ -996,35 +1025,25 @@ def task_stale_drop(
             cost_price=item.cost_price,
             listed_time=detail.listed_time,
             settle_price=detail.settle_price,
-            pricing=pricing,
-        ), decision)
+        )
+        pipeline = run_reprice_pipeline(
+            work_item,
+            sold_cache,
+            rule_engine,
+            apply_rules=True,
+        )
+        pricing = pipeline["pricing"]
+        decision = pipeline["decision"]
 
         if stale_days >= stage2:
-            base_price = decision.get("system_price") or pricing.cons_price or detail.current_price
-            new_price = round(base_price * (1 - drop_pct / 100), 0)
-            new_price = _clamp_price(new_price, decision.get("market_floor"), decision.get("market_cap"))
-            stale_decision = _assess_manual_review(item, new_price, decision.get("cost_floor"))
-            decision = {**decision, **stale_decision, "final_price": new_price, "final_settle_price": stale_decision.get("settle_price")}
-            preview = _pricing_preview(pricing, rule_engine, BatchItem(
-                product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                current_price=detail.current_price,
-                status=detail.status,
-                account_name=account.name,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
-                cost_price=item.cost_price,
-                listed_time=detail.listed_time,
-                settle_price=detail.settle_price,
-                pricing=pricing,
-            ), decision)
+            base_price = decision.get("system_price") or getattr(pricing, "conservative_price", None) or detail.current_price
+            stage_price = _normalize_tail8_price(base_price * (1 - drop_pct / 100))
+            decision = recalc_decision_with_final_price(work_item, decision, stage_price)
             stage_label = "阶段2"
         else:
-            base_price = decision.get("system_price") or pricing.cons_price
+            base_price = decision.get("system_price") or getattr(pricing, "conservative_price", None)
             if base_price is None or base_price >= detail.current_price:
+                preview = _pricing_preview(pricing, rule_engine, work_item, decision)
                 imported_store.update_item(
                     item.product_id,
                     pricing=pricing,
@@ -1033,7 +1052,7 @@ def task_stale_drop(
                     floor_price=pricing.floor_price,
                     suggested_settle_price=None,
                     confidence=getattr(pricing.confidence, "value", pricing.confidence),
-                    rule_hit=pricing.rule_hit,
+                    rule_hit=decision.get("rule_hit", ""),
                     reprice_ok=None,
                     reprice_msg=f"保守价无下降空间｜{preview}",
                     op_status="跳过",
@@ -1042,27 +1061,11 @@ def task_stale_drop(
                 _log(f"[{account.name}] [{detail.qc_code or item.qc_code}] 跳过: 保守价无下降空间｜{preview}", on_progress)
                 skip += 1
                 continue
-            new_price = round(base_price, 0)
-            new_price = _clamp_price(new_price, decision.get("market_floor"), decision.get("market_cap"))
-            stage_decision = _assess_manual_review(item, new_price, decision.get("cost_floor"))
-            decision = {**decision, **stage_decision, "final_price": new_price, "final_settle_price": stage_decision.get("settle_price")}
-            preview = _pricing_preview(pricing, rule_engine, BatchItem(
-                product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                current_price=detail.current_price,
-                status=detail.status,
-                account_name=account.name,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
-                cost_price=item.cost_price,
-                listed_time=detail.listed_time,
-                settle_price=detail.settle_price,
-                pricing=pricing,
-            ), decision)
+            decision = recalc_decision_with_final_price(work_item, decision, _normalize_tail8_price(base_price))
             stage_label = "阶段1"
+
+        new_price = decision.get("final_price")
+        preview = _pricing_preview(pricing, rule_engine, work_item, decision)
 
         if decision.get("needs_manual_review"):
             manual_reason = decision.get("manual_review_reason") or f"{stage_label}建议价低于成本，需人工确认"
@@ -1074,7 +1077,7 @@ def task_stale_drop(
                 floor_price=pricing.floor_price,
                 suggested_settle_price=decision.get("final_settle_price"),
                 confidence=getattr(pricing.confidence, "value", pricing.confidence),
-                rule_hit=pricing.rule_hit,
+                rule_hit=decision.get("rule_hit", ""),
                 reprice_ok=None,
                 reprice_msg=f"{manual_reason}｜{preview}",
                 op_status="待确认",
@@ -1084,7 +1087,7 @@ def task_stale_drop(
             skip += 1
             continue
 
-        if abs(new_price - detail.current_price) < 1:
+        if new_price is None or abs(new_price - detail.current_price) < 1:
             imported_store.update_item(
                 item.product_id,
                 reprice_ok=None,
@@ -1099,18 +1102,19 @@ def task_stale_drop(
         success, msg = svc.change_price(detail, new_price)
         if success:
             ok += 1
-            settle = PricingEngine.calc_settle_price(new_price)
             refreshed = _refresh_imported_detail(svc, item)
+            record_source = refreshed or detail
+            settle = _resolve_final_settle_price(svc, detail.product_id, new_price, refreshed)
             history_db.record(PriceChangeRecord(
                 id=None,
                 timestamp=datetime.datetime.now(),
                 product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
+                qc_code=getattr(record_source, "qc_code", detail.qc_code) or item.qc_code,
+                title=getattr(record_source, "title", detail.title),
+                model=getattr(record_source, "model", detail.model),
+                condition=getattr(record_source, "condition", detail.condition),
+                capacity=getattr(record_source, "capacity", detail.capacity),
+                color=getattr(record_source, "color", detail.color),
                 old_price=detail.current_price,
                 new_price=new_price,
                 diff=new_price - detail.current_price,
@@ -1129,9 +1133,9 @@ def task_stale_drop(
                 capacity=getattr(refreshed, "capacity", detail.capacity),
                 color=getattr(refreshed, "color", detail.color),
                 current_price=getattr(refreshed, "current_price", new_price),
-                settle_price=getattr(refreshed, "settle_price", settle) or settle,
+                settle_price=settle,
                 suggested_price=new_price,
-                suggested_settle_price=getattr(refreshed, "settle_price", settle) or settle,
+                suggested_settle_price=settle,
                 listed_time=getattr(refreshed, "listed_time", detail.listed_time),
                 status=getattr(refreshed, "status", detail.status),
                 status_detail=_status_detail_from_obj(refreshed or detail),
@@ -1170,10 +1174,9 @@ def task_auto_list(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """仅对导入商品管理中的未上架商品执行自动定价上架"""
-    engine = PricingEngine()
     history_db = get_history_db()
     accounts = {account.name: account for account in account_store.enabled_accounts()}
-    items = _iter_actionable_items(imported_store)
+    items = imported_store.get_all()
     ok = fail = skip = 0
 
     def log(msg):
@@ -1186,7 +1189,20 @@ def task_auto_list(
         return {"ok": 0, "fail": 0, "skip": 0, "error": ""}
 
     services: dict[str, ImeiService] = {}
+    login_state_cache: dict[str, tuple[bool, str]] = {}
     for item in items:
+        skip_reason = _listing_skip_reason(item)
+        if skip_reason:
+            imported_store.update_item(
+                item.product_id,
+                reprice_ok=None,
+                reprice_msg=skip_reason,
+                op_status="跳过",
+                op_message=skip_reason,
+            )
+            skip += 1
+            continue
+
         account = accounts.get(item.account_name)
         if not account:
             imported_store.update_item(
@@ -1203,6 +1219,20 @@ def task_auto_list(
         if svc is None:
             svc = ImeiService(account.name, account.cookie)
             services[account.name] = svc
+
+        login_ok, login_reason = _account_login_state(svc, account.name, login_state_cache)
+        if not login_ok:
+            reason_text = str(login_reason or "登录状态过期，请重新登录").strip()
+            imported_store.update_item(
+                item.product_id,
+                op_status="失败",
+                op_message=f"自动上架跳过：账号登录失效（{reason_text}）",
+                reprice_ok=False,
+                reprice_msg=f"账号登录失效：{reason_text}",
+            )
+            log(f"[{account.name}] [{item.qc_code or item.product_id}] 跳过: 账号登录失效（{reason_text}）")
+            fail += 1
+            continue
 
         try:
             detail = _refresh_imported_detail(svc, item)
@@ -1228,6 +1258,7 @@ def task_auto_list(
             fail += 1
             continue
 
+        refreshed_listing_eligible = getattr(item, "import_source", "") in _allowed_listing_import_sources() and detail.status == ProductStatus.NOT_LISTED
         imported_store.update_item(
             item.product_id,
             qc_code=detail.qc_code or item.qc_code,
@@ -1241,21 +1272,23 @@ def task_auto_list(
             status_detail=_status_detail_from_obj(detail),
             listed_time=detail.listed_time,
             settle_price=detail.settle_price,
+            import_source=getattr(item, "import_source", ""),
+            listing_eligible=refreshed_listing_eligible,
         )
 
-        if detail.status != ProductStatus.NOT_LISTED:
+        refreshed_item = imported_store.get(item.product_id) or item
+        refreshed_skip_reason = _listing_skip_reason(refreshed_item)
+        if refreshed_skip_reason:
             imported_store.update_item(
                 item.product_id,
                 reprice_ok=None,
-                reprice_msg=f"当前状态 {detail.status.label}",
+                reprice_msg=refreshed_skip_reason,
                 op_status="跳过",
-                op_message="仅处理未上架商品",
+                op_message=refreshed_skip_reason,
             )
             skip += 1
             continue
 
-        records = sold_cache.filter_by_model_key(detail.model, detail.condition, detail.capacity, detail.color)
-        pricing = engine.calculate(records, detail.model, detail.condition, detail.capacity, detail.color)
         work_item = BatchItem(
             product_id=detail.product_id,
             qc_code=detail.qc_code or item.qc_code,
@@ -1270,11 +1303,21 @@ def task_auto_list(
             cost_price=item.cost_price,
             listed_time=detail.listed_time,
             settle_price=detail.settle_price,
-            pricing=pricing,
+            import_source=getattr(item, "import_source", ""),
+            listing_eligible=refreshed_listing_eligible,
         )
-        decision = build_reprice_decision(work_item, pricing, rule_engine, apply_rules=True)
-        price = decision.get("final_price")
-        preview = _pricing_preview(pricing, rule_engine, work_item, decision)
+        pipeline = run_reprice_pipeline(
+            work_item,
+            sold_cache,
+            rule_engine,
+            apply_rules=True,
+            settle_price_estimator=lambda price, product_id=detail.product_id: _estimate_suggested_settle_price(svc, product_id, price),
+        )
+        pricing = pipeline["pricing"]
+        decision = pipeline["decision"]
+        preview = pipeline["preview"]
+        price = pipeline["suggested_price"]
+
         if price is None:
             imported_store.update_item(
                 item.product_id,
@@ -1284,7 +1327,7 @@ def task_auto_list(
                 floor_price=pricing.floor_price,
                 suggested_settle_price=None,
                 confidence=getattr(pricing.confidence, "value", pricing.confidence),
-                rule_hit=pricing.rule_hit,
+                rule_hit=decision.get("rule_hit", ""),
                 op_status="跳过",
                 op_message=f"无定价依据，未执行自动上架｜{preview}",
                 reprice_ok=None,
@@ -1293,7 +1336,7 @@ def task_auto_list(
             skip += 1
             continue
 
-        price = round(price, 0)
+        price = _normalize_tail8_price(price)
         if decision.get("needs_manual_review"):
             imported_store.update_item(
                 item.product_id,
@@ -1303,7 +1346,7 @@ def task_auto_list(
                 floor_price=pricing.floor_price,
                 suggested_settle_price=decision.get("final_settle_price"),
                 confidence=getattr(pricing.confidence, "value", pricing.confidence),
-                rule_hit=pricing.rule_hit,
+                rule_hit=decision.get("rule_hit", ""),
                 op_status="待确认",
                 op_message=f"自动上架已拦截，需人工确认｜{preview}",
                 reprice_ok=None,
@@ -1313,7 +1356,7 @@ def task_auto_list(
             skip += 1
             continue
 
-        suggested_settle = _estimate_suggested_settle_price(svc, detail.product_id, float(price))
+        suggested_settle = pipeline.get("suggested_settle_price")
         imported_store.update_item(
             item.product_id,
             pricing=pricing,
@@ -1322,13 +1365,14 @@ def task_auto_list(
             floor_price=pricing.floor_price,
             suggested_settle_price=suggested_settle,
             confidence=getattr(pricing.confidence, "value", pricing.confidence),
-            rule_hit=pricing.rule_hit,
+            rule_hit=decision.get("rule_hit", ""),
         )
         success, msg = svc.list_product(detail.product_id, price, detail.qc_code)
         if success:
             ok += 1
             settle = PricingEngine.calc_settle_price(price)
             refreshed = _refresh_imported_detail(svc, item) or detail
+            record_source = refreshed or detail
             imported_store.update_item(
                 item.product_id,
                 qc_code=getattr(refreshed, "qc_code", detail.qc_code) or item.qc_code,
@@ -1346,6 +1390,7 @@ def task_auto_list(
                 status_detail=_status_detail_from_obj(refreshed or detail),
                 pricing=pricing,
                 new_price=price,
+                listing_eligible=getattr(refreshed, "status", None) == ProductStatus.NOT_LISTED,
                 reprice_ok=True,
                 reprice_msg=msg or "自动上架成功",
                 op_status="已上架",
@@ -1356,12 +1401,12 @@ def task_auto_list(
                 id=None,
                 timestamp=datetime.datetime.now(),
                 product_id=detail.product_id,
-                qc_code=detail.qc_code or item.qc_code,
-                title=detail.title,
-                model=detail.model,
-                condition=detail.condition,
-                capacity=detail.capacity,
-                color=detail.color,
+                qc_code=getattr(record_source, "qc_code", detail.qc_code) or item.qc_code,
+                title=getattr(record_source, "title", detail.title),
+                model=getattr(record_source, "model", detail.model),
+                condition=getattr(record_source, "condition", detail.condition),
+                capacity=getattr(record_source, "capacity", detail.capacity),
+                color=getattr(record_source, "color", detail.color),
                 old_price=0,
                 new_price=price,
                 diff=price,

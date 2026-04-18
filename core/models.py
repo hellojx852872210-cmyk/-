@@ -29,6 +29,11 @@ class ItemStatus(Enum):
     @classmethod
     def from_raw(cls, raw) -> "ItemStatus":
         s = str(raw).strip()
+        alias_map = {
+            "70": cls.ON_SALE,
+        }
+        if s in alias_map:
+            return alias_map[s]
         for member in cls:
             if member.value == s:
                 return member
@@ -259,6 +264,10 @@ class BatchItem:
     selected: bool = True
     category: str = ""
     ignored: bool = False
+    import_source: str = ""
+    listing_eligible: bool = False
+    needs_manual_review: bool = False
+    manual_review_reason: str = ""
     op_status: str = "待处理"
     op_message: str = ""
     pricing: Optional[PricingResult] = None

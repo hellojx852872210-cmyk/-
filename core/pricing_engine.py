@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -110,15 +111,35 @@ class PricingEngine:
         market_base_price = self._blend_prices(conservative_price, fast_price, primary_ratio=0.6)
         age_discount_factor = 1.0
         age_adjusted_price = market_base_price
-        recommended_seed = self._blend_prices(fast_price, conservative_price, primary_ratio=0.7)
+        heuristic_seed = self._blend_prices(fast_price, conservative_price, primary_ratio=0.7)
+        market_cap_price = self._blend_prices(short_median, long_median, primary_ratio=0.65)
+        if market_cap_price is None:
+            market_cap_price = max(v for v in (fast_price, conservative_price, heuristic_seed) if v is not None)
+
+        turnover_choice = self._select_turnover_optimal_price(
+            pricing_records,
+            weighted,
+            now,
+            allow_older=use_fallback_records,
+            market_floor=market_floor_price,
+            market_cap=market_cap_price,
+            anchors=[fast_price, conservative_price, short_anchor, market_base_price, heuristic_seed],
+        )
+        turnover_seed = turnover_choice.get("price")
+        recommended_seed = turnover_seed if turnover_seed is not None else heuristic_seed
         recommended = self._apply_trend_adjustment(recommended_seed, trend_adjust_pct)
         if recommended is None:
             recommended = conservative_price
         if recommended is not None and floor_price is not None:
             recommended = max(recommended, floor_price)
-        market_cap_price = self._blend_prices(short_median, long_median, primary_ratio=0.65)
-        if market_cap_price is None:
-            market_cap_price = max(v for v in (fast_price, conservative_price, recommended) if v is not None)
+        if recommended is not None and market_cap_price is not None:
+            recommended = min(recommended, market_cap_price)
+
+        spread_ratio = self._spread_ratio(weighted)
+        volatility_blend_weight = 0.0
+        if spread_ratio >= 0.12 and conservative_price is not None and recommended is not None:
+            volatility_blend_weight = min(0.8, 0.35 + max(spread_ratio - 0.12, 0.0) * 2.5)
+            recommended = self._blend_prices(conservative_price, recommended, primary_ratio=volatility_blend_weight)
 
         settle_seed = self._blend_prices(fast_settle, short_settle or conservative_settle, primary_ratio=0.7)
         settle = self._apply_trend_adjustment(settle_seed, trend_adjust_pct)
@@ -154,6 +175,16 @@ class PricingEngine:
         if exact_sample_count and fallback_sample_count:
             warning_parts.append(f"精确样本 {exact_sample_count}，补充样本 {fallback_sample_count}")
 
+        if turnover_choice.get("price") is not None:
+            warning_parts.append(
+                "周转优选 "
+                f"{turnover_choice['price']:.0f}"
+                f" (成交概率 {turnover_choice.get('accept_prob', 0.0):.2f}"
+                f", 预计售出小时 {turnover_choice.get('sell_hours', 0.0):.1f}"
+                f", 效率分 {turnover_choice.get('score', 0.0):.4f})"
+            )
+        if volatility_blend_weight > 0:
+            warning_parts.append(f"波动收缩 已向保守价收缩 {volatility_blend_weight * 100:.0f}%")
         return PricingResult(
             title=title,
             sample_count=len(pricing_records),
@@ -257,8 +288,112 @@ class PricingEngine:
                 weighted_settle.extend([settle_price] * weight)
         return sorted(weighted_prices), sorted(weighted_settle)
 
+    def _weighted_median(self, values: list[float]) -> Optional[float]:
+        return self._percentile(sorted(values), 50)
+
+    def _candidate_prices(
+        self,
+        weighted_prices: list[float],
+        market_floor: Optional[float],
+        market_cap: Optional[float],
+        anchors: list[Optional[float]],
+    ) -> list[float]:
+        candidates: set[float] = set()
+        for pct in (20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70):
+            val = self._percentile(weighted_prices, pct)
+            if val is not None:
+                candidates.add(round(float(val), 0))
+        for anchor in anchors:
+            if anchor is not None:
+                candidates.add(round(float(anchor), 0))
+
+        clipped: list[float] = []
+        for price in sorted(candidates):
+            value = float(price)
+            if market_floor is not None:
+                value = max(value, float(market_floor))
+            if market_cap is not None:
+                value = min(value, float(market_cap))
+            clipped.append(round(value, 0))
+
+        return sorted(set(clipped))
+
+    def _select_turnover_optimal_price(
+        self,
+        records: List[SoldRecord],
+        weighted_prices: list[float],
+        now: datetime,
+        *,
+        allow_older: bool,
+        market_floor: Optional[float],
+        market_cap: Optional[float],
+        anchors: list[Optional[float]],
+    ) -> dict:
+        candidates = self._candidate_prices(weighted_prices, market_floor, market_cap, anchors)
+        if not candidates:
+            return {"price": None, "accept_prob": 0.0, "sell_hours": 0.0, "score": 0.0}
+
+        weighted_records: list[tuple[float, Optional[float], int]] = []
+        for record in records:
+            weight = self._record_weight(record, now, allow_older)
+            hours = record.hours_to_sell
+            weighted_records.append((float(record.sold_price), float(hours) if hours is not None else None, max(weight, 1)))
+
+        total_weight = sum(weight for _, _, weight in weighted_records)
+        if total_weight <= 0:
+            return {"price": candidates[-1], "accept_prob": 0.0, "sell_hours": 0.0, "score": 0.0}
+
+        all_hours_weighted: list[float] = []
+        for _, hours, weight in weighted_records:
+            if hours is None:
+                continue
+            all_hours_weighted.extend([hours] * weight)
+        fallback_sell_hours = self._weighted_median(all_hours_weighted) or 72.0
+
+        weighted_prices_sorted = sorted(price for price, _, _ in weighted_records)
+        candidate_metrics: list[dict] = []
+
+        for candidate in candidates:
+            accepted_weight = 0
+            accepted_hours_weighted: list[float] = []
+            threshold_idx = bisect_left(weighted_prices_sorted, candidate)
+            approx_accept_prob = (len(weighted_prices_sorted) - threshold_idx) / max(len(weighted_prices_sorted), 1)
+            for sold_price, hours, weight in weighted_records:
+                if sold_price + 1e-9 < candidate:
+                    continue
+                accepted_weight += weight
+                if hours is not None:
+                    accepted_hours_weighted.extend([hours] * weight)
+
+            accept_prob = accepted_weight / total_weight if total_weight else approx_accept_prob
+            sell_hours = self._weighted_median(accepted_hours_weighted) or fallback_sell_hours
+            score = accept_prob / max(sell_hours, 1.0)
+            candidate_metrics.append(
+                {
+                    "price": candidate,
+                    "accept_prob": accept_prob,
+                    "sell_hours": sell_hours,
+                    "score": score,
+                }
+            )
+
+        if not candidate_metrics:
+            return {"price": candidates[-1], "accept_prob": 0.0, "sell_hours": fallback_sell_hours, "score": 0.0}
+
+        best_efficiency = max(candidate_metrics, key=lambda item: item["score"])
+        best_score = max(float(best_efficiency.get("score", 0.0)), 0.0)
+        score_tolerance = 0.65
+        near_best = [
+            item
+            for item in candidate_metrics
+            if best_score <= 0 or float(item.get("score", 0.0)) >= best_score * score_tolerance
+        ]
+        preferred = max(near_best, key=lambda item: item["price"]) if near_best else best_efficiency
+        return preferred
+
+
     @staticmethod
-    def _blend_prices(primary: Optional[float], secondary: Optional[float], primary_ratio: float = 0.7) -> Optional[float]:
+    def _blend_prices(primary: Optional[float], secondary: Optional[float], primary_ratio: float = 0.5) -> Optional[float]:
         if primary is None:
             return secondary
         if secondary is None:
