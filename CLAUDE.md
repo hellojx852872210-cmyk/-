@@ -125,4 +125,6 @@ python3 -m zhuanzhuan_pricing.bridge_cli \
 - Qt 自动化「商品管理（ERP 导入）」已支持按商品状态筛选（全部/在售/未上架/已售/已下架/质检中/未知）。
 - 「刷新导入状态」增加即时反馈（刷新中提示、按钮短暂禁用、防重入、最后刷新时间显示）。
 - 本节点仅涉及 UI 侧最小改动：`zhuanzhuan_pricing/ui_qt/tab_auto.py`；未改任务编排与数据层。
+- 商品管理表格新增“成本价”列，直接显示导入商品 `cost_price`，用于与 ERP 成本核对。
+- ERP 成本提取口径对齐 ERP 原值：优先 `real_cost_price`，回退 `cost_price`、`cost`，不再额外加税。
 
