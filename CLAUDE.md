@@ -128,8 +128,38 @@ python3 -m zhuanzhuan_pricing.bridge_cli \
 - 商品管理表格新增“成本价”列，直接显示导入商品 `cost_price`，用于与 ERP 成本核对。
 - ERP 成本提取口径对齐 ERP 原值：优先 `real_cost_price`，回退 `cost_price`、`cost`，不再额外加税。
 
-## UI 迭代节点（2026-04-20）
-- Qt 自动化页新增独立「手动确认调价」分组，并将入口上移为主入口（`手动确认调价（待确认 N）`），不再埋在导入工具栏。
-- 手动确认窗口继续作为统一人工决策入口，覆盖三类操作：接受调价、拒绝（永久）、拒绝并移入不处理区。
-- 自动调价预览区文案调整为“高级偏移可选”，明确偏移仅用于建议价微调，不替代手动确认流程。
-- 本节点仅涉及 UI 侧最小改动：`zhuanzhuan_pricing/ui_qt/tab_auto.py`；未改任务编排与数据层。
+## 官方建议价接入节点（2026-04-22）
+- 官方建议价接口已接入自动化定价主链，采用“样本不足 fallback + 样本充足偏离对照”的策略。
+
+### 1) API 入口（转转官方建议价）
+- `zhuanzhuan_pricing/services/zhuanzhuan_api.py`
+  - `ImeiService.query_official_reference_price(...)`
+  - 对接接口：`queryDoubleGradePurchasePrice`
+
+### 2) automation 注入入口
+- `zhuanzhuan_pricing/automation/tasks.py`
+  - `_fetch_official_reference_for_item(...)`
+  - 在三条任务链路注入 `official_reference_fetcher`：
+    - `task_auto_reprice`
+    - `task_stale_drop`
+    - `task_auto_list`
+
+### 3) 定价流水线入口
+- `zhuanzhuan_pricing/services/reprice_service.py`
+  - `run_reprice_pipeline(..., official_reference_fetcher=...)`
+  - `build_reprice_decision(..., official_reference=...)`
+
+### 4) 决策输出与风控信号
+- `build_reprice_decision` 输出新增官方信号字段：
+  - `official_reference_price`
+  - `official_reference_settle_price`
+  - `official_reference_grade_name`
+  - `official_reference_sku_id`
+  - `official_reference_used_as_anchor`
+  - `official_deviation_pct` / `official_deviation_abs`
+  - `official_risk_triggered` / `official_risk_reason`
+- 与现有成本/利润守卫并集触发手动确认，不改变既有手动确认闭环。
+
+### 5) UI 预览节点
+- `zhuanzhuan_pricing/ui_qt/tab_auto.py`
+  - 自动化预览区新增官方参考信息展示：官方参考价、相对官方偏离、是否触发官方风控。
