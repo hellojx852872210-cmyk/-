@@ -163,3 +163,36 @@ python3 -m zhuanzhuan_pricing.bridge_cli \
 ### 5) UI 预览节点
 - `zhuanzhuan_pricing/ui_qt/tab_auto.py`
   - 自动化预览区新增官方参考信息展示：官方参考价、相对官方偏离、是否触发官方风控。
+
+## Agent 使用说明（2026-05-09）
+
+### 入口
+- 一键启动脚本：`启动改价Agent.command`
+- 命令行入口：`python3 -m zhuanzhuan_pricing.automation.agent_runner`
+
+### 启动前交互配置
+`启动改价Agent.command` 启动时会依次询问：
+1. 是否新增/更新店铺账号（交互输入 name/note/cookie）
+2. 是否再添加一个账号
+3. 任务组合（`erp_sync` / `auto_reprice` / `stale_drop`）
+4. 轮询间隔秒数
+5. 待确认处理策略
+6. 是否执行 cookie 校验
+
+### 运行日志与表格
+- 每轮结束后输出两张表：
+  - 任务汇总表：`Task | Total | OK | Skip | Fail | ManualReview | Persisted | Note`
+  - 改价记录样例表：`Task | Account | Item | Old | New | Diff | Trigger`
+- 若本轮无改价写入，会提示：`Cycle repricing records: no persisted price changes`
+- 每轮结束后会打印等待信息：`Cycle N idle: waiting Xs, next cycle at HH:MM:SS`
+
+### 待确认处理策略
+- 支持命令：
+  - `python3 -m zhuanzhuan_pricing.automation.agent_runner config resolve-manual-review --mode reject_and_ignore`
+- Agent 每轮结束后会自动执行一次待确认处理，避免无人值守时堆积。
+
+### 跨电脑使用
+1. 在新电脑 clone 仓库
+2. 安装 Python 依赖
+3. 运行 `启动改价Agent.command`，在本机重新录入账号 cookie
+4. 建议先用较短间隔小流量观察，再逐步放量
