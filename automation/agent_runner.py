@@ -4,23 +4,41 @@ from __future__ import annotations
 import argparse
 import datetime
 import getpass
+import hashlib
+import json
 import os
+import select
+import socket
+import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Callable
 
+
+AUTH_CONFIG_FILE = Path(__file__).resolve().parents[2] / "config" / "agent_auth.json"
+
+import requests
+
+from ..config import cfg
 from ..core.models import Account
 from ..core.rule_engine import RuleEngine
 from ..core.batch_store import BatchItemStore
 from ..services.data_store import AccountStore, SoldCache, CostPriceMap
 from ..services.erp_service import ErpConfig
+from ..services.notify_service import FeishuRobotNotifier, WxAppClient, WxAppConfig, WxRobotNotifier
+from ..services.mysql_store import get_mysql_store
 from ..services.zhuanzhuan_api import ImeiService
 from .tasks import (
     MANUAL_REVIEW_ACTION_REJECT_AND_IGNORE,
     MANUAL_REVIEW_STATE_PENDING,
     apply_manual_review_batch_decision,
+    apply_manual_review_decision,
     task_auto_list,
     task_auto_reprice,
     task_erp_sync,
+    task_probe_perturbation,
     task_sales_report,
     task_stale_drop,
 )
@@ -42,6 +60,13 @@ class AgentRuntime:
         self.rule_engine = RuleEngine()
         self.erp_config = ErpConfig()
         self.imported_store = BatchItemStore()
+        self.imported_pool_file = str(_runtime_dir() / "imported_items_pool.json")
+        self.wx_app_config = WxAppConfig()
+        self.wx_app_client = WxAppClient(self.wx_app_config)
+        self.wx_robot_notifier = WxRobotNotifier(str(self.wx_app_config.get("robot_webhook", "") or ""))
+        self.feishu_robot_notifier = FeishuRobotNotifier(str(self.wx_app_config.get("feishu_webhook", "") or ""))
+        restored = self.imported_store.load_from_file(self.imported_pool_file)
+        _log(f"导入商品池恢复: {restored} 条（{self.imported_pool_file}）")
 
 
 TaskFunc = Callable[[AgentRuntime], dict | str]
@@ -113,9 +138,1027 @@ def _collect_persisted_rows(task_name: str, result: dict | str | None) -> list[l
             _fmt_money(sample.get("old_price")),
             _fmt_money(sample.get("new_price")),
             _fmt_money(sample.get("diff")),
+            str(sample.get("model") or "-"),
+            str(sample.get("condition") or "-"),
+            str(sample.get("qc_code") or "-"),
+            str(sample.get("imei") or "-"),
+            _fmt_money(sample.get("settle_price")),
+            str(sample.get("changed_at") or "-"),
             str(sample.get("trigger") or "-"),
         ])
     return rows
+
+
+def _collect_risk_bucket(task_name: str, result: dict | str | None) -> dict[str, int]:
+    if not isinstance(result, dict):
+        return {}
+    raw = result.get("risk_bucket")
+    if not isinstance(raw, dict):
+        return {}
+    merged: dict[str, int] = {}
+    for key, value in raw.items():
+        label = str(key or "none").strip() or "none"
+        merged[label] = merged.get(label, 0) + _to_int(value, 0)
+    return merged
+
+
+def _risk_source_label(source: str) -> str:
+    mapping = {
+        "none": "无风险标签",
+        "low_sample": "样本不足",
+        "below_target_profit": "低于目标利润",
+        "below_cost": "低于成本",
+        "direction_lock": "方向锁定",
+        "cooldown": "冷却期",
+        "oscillation": "价格震荡",
+        "official_deviation": "官方参考价偏离",
+    }
+    key = str(source or "none").strip() or "none"
+    return mapping.get(key, key)
+
+
+def _build_risk_summary_rows(risk_stats: dict[str, dict[str, int]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for source in sorted(risk_stats.keys(), key=lambda x: (-risk_stats[x].get("count", 0), x)):
+        stat = risk_stats[source]
+        rows.append([
+            _risk_source_label(source),
+            str(_to_int(stat.get("count"), 0)),
+            str(_to_int(stat.get("auto_passed"), 0)),
+            str(_to_int(stat.get("manual_review"), 0)),
+            str(_to_int(stat.get("skipped"), 0)),
+        ])
+    return rows
+
+
+def _risk_natural_summary(risk_stats: dict[str, dict[str, int]]) -> str:
+    if not risk_stats:
+        return "本轮无风险标签数据"
+    ranked = sorted(
+        [(source, _to_int(data.get("count"), 0)) for source, data in risk_stats.items()],
+        key=lambda kv: (-kv[1], kv[0]),
+    )
+    if not ranked:
+        return "本轮无风险标签数据"
+    top = ranked[0]
+    top_label = _risk_source_label(top[0])
+    if len(ranked) == 1:
+        return f"本轮风险主要来源：{top_label}（{top[1]} 条）"
+    second = ranked[1]
+    second_label = _risk_source_label(second[0])
+    return f"本轮风险主要来源：{top_label}（{top[1]} 条），其次 {second_label}（{second[1]} 条）"
+
+
+def _wechat_cycle_report_enabled() -> bool:
+    from ..config import cfg
+    return bool(cfg.get("report_wechat_enabled", False))
+
+
+def _snapshot_inventory_state(runtime: AgentRuntime) -> dict[str, tuple[str, str, str]]:
+    state: dict[str, tuple[str, str, str]] = {}
+    for item in runtime.imported_store.get_all():
+        pid = str(getattr(item, "product_id", "") or "").strip()
+        if not pid:
+            continue
+        state[pid] = (
+            str(getattr(item, "account_name", "") or "-"),
+            str(getattr(getattr(item, "status", None), "label", getattr(item, "status", "未知")) or "未知"),
+            str(getattr(item, "qc_code", "") or pid),
+        )
+    return state
+
+
+def _collect_inventory_changes(before: dict[str, tuple[str, str, str]], after: dict[str, tuple[str, str, str]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for pid, after_data in after.items():
+        if pid not in before:
+            continue
+        before_data = before[pid]
+        if before_data[1] == after_data[1]:
+            continue
+        rows.append([after_data[0], after_data[2], before_data[1], after_data[1]])
+    return rows
+
+
+def _collect_turnover_metrics(runtime: AgentRuntime, target_date: datetime.date | None = None) -> dict[str, float | int | list[dict[str, str]]]:
+    today = target_date or datetime.date.today()
+    owned_product_ids = {
+        str(getattr(item, "product_id", "") or "").strip()
+        for item in runtime.imported_store.get_all()
+        if str(getattr(item, "product_id", "") or "").strip()
+    }
+    sold_records = runtime.sold_cache.load()
+    owned_today_records = []
+    for row in sold_records:
+        sold_time = getattr(row, "sold_time", None)
+        if not sold_time or sold_time.date() != today:
+            continue
+        if str(getattr(row, "product_id", "") or "").strip() not in owned_product_ids:
+            continue
+        owned_today_records.append(row)
+
+    latest_record_by_pid: dict[str, object] = {}
+    for row in sorted(owned_today_records, key=lambda x: getattr(x, "sold_time", datetime.datetime.min), reverse=True):
+        pid = str(getattr(row, "product_id", "") or "").strip()
+        if not pid or pid in latest_record_by_pid:
+            continue
+        latest_record_by_pid[pid] = row
+
+    unique_today_records = list(latest_record_by_pid.values())
+    sold_today = len(unique_today_records)
+    _log(
+        "动销口径核对："
+        f"缓存总数 {len(sold_records)}，"
+        f"今日+ERP池原始条数 {len(owned_today_records)}，"
+        f"按product_id去重后 {sold_today}"
+    )
+    on_sale_count = len(runtime.imported_store.on_sale_snapshot())
+    denominator = sold_today + on_sale_count
+    turnover_rate = (sold_today / denominator) if denominator > 0 else 0.0
+    sales_detail: list[dict[str, str]] = []
+    for row in unique_today_records:
+        sold_price = "-"
+        settle_price = "-"
+        try:
+            sold_price = f"{float(getattr(row, 'sold_price', 0.0) or 0.0):.0f}"
+        except Exception:
+            sold_price = "-"
+        try:
+            settle_raw = getattr(row, "settle_price", None)
+            if settle_raw is not None:
+                settle_price = f"{float(settle_raw):.0f}"
+        except Exception:
+            settle_price = "-"
+        sales_detail.append(
+            {
+                "product_id": str(getattr(row, "product_id", "") or "-"),
+                "model": str(getattr(row, "model", "") or "-"),
+                "condition": str(getattr(row, "condition", "") or "-"),
+                "sold_price": sold_price,
+                "settle_price": settle_price,
+                "sold_time": getattr(row, "sold_time", datetime.datetime.min).strftime("%H:%M") if getattr(row, "sold_time", None) else "-",
+            }
+        )
+    return {
+        "sold_today": sold_today,
+        "on_sale_count": on_sale_count,
+        "turnover_rate": turnover_rate,
+        "sales_detail": sales_detail,
+    }
+
+
+def _network_preflight(timeout_seconds: float = 1.5) -> tuple[bool, str]:
+    endpoints = [("api.zhuanzhuan.com", 443), ("open.feishu.cn", 443)]
+    for host, port in endpoints:
+        try:
+            with socket.create_connection((host, port), timeout=timeout_seconds):
+                continue
+        except Exception as exc:
+            return False, f"{host}:{port} unreachable ({exc})"
+    return True, "ok"
+
+
+def _build_cycle_report_message(*, cycle: int, task_rows: list[list[str]], persisted_rows: list[list[str]], risk_stats: dict[str, dict[str, int]], risk_summary_text: str, inventory_change_rows: list[list[str]], turnover_metrics: dict[str, float | int]) -> str:
+    total_ok = sum(_to_int(row[2], 0) for row in task_rows if len(row) >= 3)
+    total_skip = sum(_to_int(row[3], 0) for row in task_rows if len(row) >= 4)
+    total_fail = sum(_to_int(row[4], 0) for row in task_rows if len(row) >= 5)
+    total_manual = sum(_to_int(row[5], 0) for row in task_rows if len(row) >= 6)
+    total_persisted = len(persisted_rows)
+    sold_today = _to_int(turnover_metrics.get("sold_today"), 0)
+    on_sale_count = _to_int(turnover_metrics.get("on_sale_count"), 0)
+    turnover_rate = float(turnover_metrics.get("turnover_rate") or 0.0)
+    lines = [
+        f"📊 Agent 轮次汇总 #{cycle}",
+        f"执行结果：成功 {total_ok}，跳过 {total_skip}，失败 {total_fail}",
+        f"待确认：{total_manual}，改价写入：{total_persisted}",
+        f"今日销售：{sold_today}，在架数量：{on_sale_count}，动销率：{turnover_rate:.2%}",
+        risk_summary_text,
+    ]
+
+    if task_rows:
+        lines.append("任务明细:")
+        for row in task_rows[:8]:
+            if len(row) < 8:
+                continue
+            lines.append(
+                f"- {row[0]}: total={row[1]} ok={row[2]} skip={row[3]} fail={row[4]} manual={row[5]} persisted={row[6]}"
+            )
+
+    if persisted_rows:
+        lines.append("改价明细(全量):")
+        for row in persisted_rows:
+            if len(row) < 13:
+                continue
+            lines.append(
+                f"- [{row[0]}] [{row[1]}] 型号:{row[6]} 成色:{row[7]} 时间:{row[11]}"
+                f"\n  标识 qc:{row[8]} imei:{row[9]}"
+                f"\n  价格 {row[3]}→{row[4]} ({row[5]}) 到手:{row[10]} trigger:{row[12]}"
+            )
+
+    sales_detail = list(turnover_metrics.get("sales_detail") or [])
+    if sales_detail:
+        lines.append(f"今日销售明细：{len(sales_detail)} 台")
+        for idx, row in enumerate(sales_detail, start=1):
+            lines.append(
+                f"{idx}. [{row.get('product_id', '-')}] 型号:{row.get('model', '-')} 成色:{row.get('condition', '-')} 成交:{row.get('sold_price', '-')} 到手:{row.get('settle_price', '-')} 时间:{row.get('sold_time', '-')}"
+            )
+    else:
+        lines.append("今日销售明细：0 台")
+
+    if risk_stats:
+        top = sorted(risk_stats.items(), key=lambda kv: (-_to_int(kv[1].get("count"), 0), kv[0]))[:3]
+        lines.append("风险Top:")
+        for idx, (source, data) in enumerate(top, start=1):
+            lines.append(f"{idx}. {source}: {_to_int(data.get('count'), 0)}")
+    if inventory_change_rows:
+        lines.append(f"库存状态变更：{len(inventory_change_rows)} 条")
+        for idx, row in enumerate(inventory_change_rows[:10], start=1):
+            lines.append(f"{idx}. [{row[0]}] [{row[1]}] {row[2]}→{row[3]}")
+        if len(inventory_change_rows) > 10:
+            lines.append(f"… 其余 {len(inventory_change_rows) - 10} 条省略")
+    else:
+        lines.append("库存状态变更：0 条")
+    return "\n".join(lines)
+
+
+def _runtime_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "runtime"
+
+
+def _load_agent_auth_config() -> dict:
+    if not AUTH_CONFIG_FILE.exists():
+        return {"auth_required": False, "users": []}
+    try:
+        with AUTH_CONFIG_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"auth_required": False, "users": []}
+        users = data.get("users")
+        if not isinstance(users, list):
+            users = []
+        return {
+            "auth_required": bool(data.get("auth_required", False)),
+            "users": users,
+            "feishu_usage_app_token": str(data.get("feishu_usage_app_token") or "").strip(),
+            "feishu_usage_table_id": str(data.get("feishu_usage_table_id") or "").strip(),
+            "remote_auth_enabled": bool(data.get("remote_auth_enabled", False)),
+            "feishu_auth_app_id": str(data.get("feishu_auth_app_id") or "").strip(),
+            "feishu_auth_app_secret": str(data.get("feishu_auth_app_secret") or "").strip(),
+            "feishu_auth_app_token": str(data.get("feishu_auth_app_token") or "").strip(),
+            "feishu_auth_table_id": str(data.get("feishu_auth_table_id") or "").strip(),
+        }
+    except Exception:
+        return {"auth_required": False, "users": []}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _verify_agent_access_local(*, user_id: str, access_key: str, cfg: dict) -> tuple[bool, str]:
+    uid = str(user_id or "").strip()
+    key = str(access_key or "")
+    if not uid or not key:
+        return False, "missing --agent-user-id or --agent-access-key"
+
+    users = list(cfg.get("users") or [])
+    target = None
+    for row in users:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("user_id") or "").strip() != uid:
+            continue
+        if not bool(row.get("enabled", True)):
+            return False, f"user disabled: {uid}"
+        target = row
+        break
+
+    if target is None:
+        return False, f"user not found: {uid}"
+
+    expect_hash = str(target.get("key_hash") or "").strip().lower()
+    if not expect_hash:
+        return False, f"user key hash missing: {uid}"
+    actual_hash = _sha256_text(key)
+    if actual_hash != expect_hash:
+        return False, f"invalid access key for user: {uid}"
+    return True, "ok-local"
+
+
+def _verify_agent_access_remote(*, user_id: str, access_key: str, cfg: dict) -> tuple[bool, str]:
+    uid = str(user_id or "").strip()
+    key = str(access_key or "")
+    if not uid or not key:
+        return False, "missing --agent-user-id or --agent-access-key"
+
+    app_id = str(cfg.get("feishu_auth_app_id") or "").strip()
+    app_secret = str(cfg.get("feishu_auth_app_secret") or "").strip()
+    app_token = str(cfg.get("feishu_auth_app_token") or "").strip()
+    table_id = str(cfg.get("feishu_auth_table_id") or "").strip()
+    if not app_id or not app_secret or not app_token or not table_id:
+        return False, "remote auth config missing"
+
+    tenant_token = _feishu_tenant_token(app_id, app_secret)
+    if not tenant_token:
+        return False, "remote auth token empty"
+
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+    headers = {"Authorization": f"Bearer {tenant_token}", "Content-Type": "application/json"}
+    page_token = ""
+    expected = _sha256_text(key)
+
+    while True:
+        params = {"page_size": 200}
+        if page_token:
+            params["page_token"] = page_token
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        data = resp.json() if resp.content else {}
+        if int(data.get("code", -1)) != 0:
+            return False, f"remote auth query failed: {data}"
+        payload = data.get("data") or {}
+        for item in list(payload.get("items") or []):
+            fields = item.get("fields") or {}
+            row_uid = str(fields.get("user_id") or fields.get("用户ID") or "").strip()
+            if row_uid != uid:
+                continue
+            enabled = str(fields.get("enabled") or fields.get("启用") or "true").strip().lower()
+            if enabled in {"0", "false", "no", "禁用"}:
+                return False, f"user disabled: {uid}"
+            row_hash = str(fields.get("access_key_hash") or fields.get("key_hash") or fields.get("密钥哈希") or "").strip().lower()
+            if not row_hash:
+                return False, f"remote key hash missing: {uid}"
+            if row_hash != expected:
+                return False, f"invalid access key for user: {uid}"
+            return True, "ok-remote"
+        if not bool(payload.get("has_more", False)):
+            break
+        page_token = str(payload.get("page_token") or "")
+        if not page_token:
+            break
+    return False, f"user not found: {uid}"
+
+
+def _verify_agent_access(*, user_id: str, access_key: str) -> tuple[bool, str]:
+    cfg = _load_agent_auth_config()
+    if not bool(cfg.get("auth_required", False)):
+        return True, "auth disabled"
+
+    if bool(cfg.get("remote_auth_enabled", False)):
+        remote_ok, remote_reason = _verify_agent_access_remote(user_id=user_id, access_key=access_key, cfg=cfg)
+        if remote_ok:
+            return True, remote_reason
+        local_ok, local_reason = _verify_agent_access_local(user_id=user_id, access_key=access_key, cfg=cfg)
+        if local_ok:
+            return True, local_reason
+        return False, f"remote={remote_reason}; local={local_reason}"
+
+    return _verify_agent_access_local(user_id=user_id, access_key=access_key, cfg=cfg)
+
+
+def _intercept_state_file() -> Path:
+    return _runtime_dir() / "post_qc_intercept_state.json"
+
+
+def _load_intercept_state() -> dict:
+    path = _intercept_state_file()
+    if not path.exists():
+        return {"written_keys": []}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        keys = data.get("written_keys") if isinstance(data, dict) else []
+        if not isinstance(keys, list):
+            keys = []
+        return {"written_keys": [str(x) for x in keys]}
+    except Exception:
+        return {"written_keys": []}
+
+
+def _save_intercept_state(state: dict) -> None:
+    path = _intercept_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _intercept_row_key(row: dict) -> str:
+    base = "|".join([
+        str(row.get("qc_code") or ""),
+        str(row.get("qc_item_name") or ""),
+        str(row.get("post_qc_result") or ""),
+        str(row.get("sold_time") or ""),
+    ])
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def _fetch_post_qc_intercepts(runtime: AgentRuntime, days: int = 2) -> list[dict]:
+    pool_items = list(runtime.imported_store.get_all())
+    if not pool_items:
+        _log("后验拦截过滤: 商品池为空，返回0条")
+        return []
+
+    pool_by_account: dict[str, list] = {}
+    for item in pool_items:
+        account_name = str(getattr(item, "account_name", "") or "").strip()
+        if not account_name:
+            continue
+        pool_by_account.setdefault(account_name, []).append(item)
+
+    rows_by_key: dict[str, dict] = {}
+
+    def add_row(row: dict) -> None:
+        key = _intercept_row_key(row)
+        rows_by_key[key] = row
+
+    for account in runtime.account_store.enabled_accounts():
+        name = str(getattr(account, "name", "") or "").strip()
+        cookie = str(getattr(account, "cookie", "") or "").strip()
+        if not name or not cookie:
+            continue
+        svc = ImeiService(name, cookie)
+
+        # 轨道A：列表抓取
+        try:
+            for row in svc.fetch_post_qc_intercepts(days=days):
+                add_row(row)
+        except Exception as exc:
+            _log(f"抓取后验拦截失败 [{name}]: {exc}")
+
+        # 轨道B：商品池定向补采，避免列表漏单
+        for pool_item in pool_by_account.get(name, []):
+            product_id = str(getattr(pool_item, "product_id", "") or "").strip()
+            qc_code = str(getattr(pool_item, "qc_code", "") or "").strip()
+            if not product_id and not qc_code:
+                continue
+            detail = None
+            try:
+                if qc_code:
+                    detail = svc.query_by_qc_code(qc_code)
+            except Exception:
+                detail = None
+            if detail is None and product_id:
+                try:
+                    detail = svc._query_product_by_id(product_id, statuses=("1", "80", "60", "0"))
+                except Exception:
+                    detail = None
+            if detail is None:
+                continue
+
+            lifecycle_sold = ""
+            lifecycle_apply = ""
+            try:
+                body = svc._merchant_product_list({
+                    "pageNum": 1,
+                    "pageSize": 20,
+                    "tagIds": [],
+                    "noTagIds": [],
+                    "labels": [],
+                    "productIds": [str(getattr(detail, "product_id", "") or product_id)],
+                    "statusList": ["1"],
+                    "salesInShop": False,
+                })
+                items = (body.get("respData") or body.get("data") or {}).get("list") or []
+                if items:
+                    lc = (items[0].get("lifecycleTimes") or {})
+                    lifecycle_sold = str(lc.get("soldTime") or "")
+                    lifecycle_apply = str(lc.get("applyReturnTime") or "")
+            except Exception:
+                pass
+
+            effective_product_id = str(getattr(detail, "product_id", "") or product_id)
+            effective_qc_code = str(getattr(detail, "qc_code", "") or qc_code)
+            diff_items = svc.query_post_qc_diff(qc_code=effective_qc_code, product_id=effective_product_id)
+            for diff in diff_items:
+                post_result = str(diff.get("postQcResult") or "").strip()
+                if not post_result:
+                    continue
+                if any(flag in post_result for flag in ("正常", "无", "未检出", "几乎不可见")) and not any(
+                    bad in post_result for bad in ("异常", "拆", "更换", "压伤", "泛黄", "泛红", "残影", "脏污", "轻微", "细微", "画面")
+                ):
+                    continue
+                add_row({
+                    "account_name": name,
+                    "site": "YY",
+                    "qc_code": effective_qc_code,
+                    "imei": str(getattr(detail, "imei", "") or ""),
+                    "title": str(getattr(detail, "title", "") or ""),
+                    "model": str(getattr(detail, "model", "") or ""),
+                    "sold_time": lifecycle_sold,
+                    "apply_return_time": lifecycle_apply,
+                    "event_time": lifecycle_apply or lifecycle_sold,
+                    "status_name": str(getattr(getattr(detail, "status", None), "label", "") or ""),
+                    "qc_item_name": str(diff.get("qcItemName") or ""),
+                    "ori_qc_result": str(diff.get("oriQcResult") or ""),
+                    "post_qc_result": post_result,
+                    "flawed_photos": list(diff.get("flawedPhotos") or []),
+                    "product_id": effective_product_id,
+                })
+
+    rows = list(rows_by_key.values())
+
+    # 仅保留商品池内
+    pool_product_ids = {
+        str(getattr(item, "product_id", "") or "").strip()
+        for item in pool_items
+        if str(getattr(item, "product_id", "") or "").strip()
+    }
+    filtered = [
+        row for row in rows
+        if str(row.get("product_id") or "").strip() in pool_product_ids
+    ]
+    _log(f"后验拦截过滤: 原始 {len(rows)} 条 -> 商品池内 {len(filtered)} 条")
+    return filtered
+
+
+def _row_day(row: dict) -> datetime.date | None:
+    raw = str(row.get("event_time") or row.get("apply_return_time") or row.get("sold_time") or "").strip()
+    if not raw:
+        return None
+    dt = None
+    try:
+        dt = datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            dt = datetime.datetime.fromisoformat(raw)
+        except Exception:
+            dt = None
+    return dt.date() if dt else None
+
+
+def _build_intercept_summary_by_days(rows: list[dict], targets: list[datetime.date]) -> tuple[dict, dict]:
+    raw_buckets: dict[str, list[dict]] = {d.isoformat(): [] for d in targets}
+    target_set = set(targets)
+    for row in rows:
+        day = _row_day(row)
+        if day in target_set:
+            raw_buckets[day.isoformat()].append(row)
+
+    # 按“账号+qc+日期”聚合成每机每天一条，只保留差异项摘要
+    buckets: dict[str, list[dict]] = {}
+    summary: dict[str, dict] = {}
+
+    for d in targets:
+        key = d.isoformat()
+        merged: dict[str, dict] = {}
+        for row in raw_buckets[key]:
+            qc = str(row.get("qc_code") or "").strip()
+            account = str(row.get("account_name") or "").strip()
+            group_key = f"{account}|{qc}|{key}"
+            reason_piece = f"{row.get('qc_item_name') or '-'}:{row.get('post_qc_result') or '-'}"
+            photos = [str(x) for x in (row.get("flawed_photos") or []) if str(x).strip()]
+            entry = merged.get(group_key)
+            if entry is None:
+                merged[group_key] = {
+                    "account_name": account,
+                    "model": row.get("model") or row.get("title") or "-",
+                    "qc_code": qc or "-",
+                    "imei": row.get("imei") or "-",
+                    "event_time": row.get("event_time") or row.get("apply_return_time") or row.get("sold_time") or "-",
+                    "reasons": [reason_piece],
+                    "photo": photos[0] if photos else "-",
+                }
+                continue
+            if reason_piece not in entry["reasons"]:
+                entry["reasons"].append(reason_piece)
+            if entry.get("photo") in ("", "-") and photos:
+                entry["photo"] = photos[0]
+
+        machine_rows = list(merged.values())
+        # 最严格去重：同一qc同一天只留一条（优先有图，再取时间较新）
+        by_qc: dict[str, dict] = {}
+        for row in machine_rows:
+            qc_key = str(row.get("qc_code") or "-")
+            prev = by_qc.get(qc_key)
+            if prev is None:
+                by_qc[qc_key] = row
+                continue
+            prev_has_photo = str(prev.get("photo") or "-") not in ("", "-")
+            curr_has_photo = str(row.get("photo") or "-") not in ("", "-")
+            if curr_has_photo and not prev_has_photo:
+                by_qc[qc_key] = row
+                continue
+            prev_time = str(prev.get("event_time") or "")
+            curr_time = str(row.get("event_time") or "")
+            if curr_time > prev_time:
+                by_qc[qc_key] = row
+        machine_rows = list(by_qc.values())
+        buckets[key] = machine_rows
+
+        reason_count: dict[str, int] = {}
+        for item in machine_rows:
+            for reason in item.get("reasons") or []:
+                reason_count[reason] = reason_count.get(reason, 0) + 1
+        top_reasons = sorted(reason_count.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        summary[key] = {"count": len(machine_rows), "top_reasons": top_reasons}
+
+    return summary, buckets
+
+
+def _format_intercept_summary_message(summary: dict, buckets: dict[str, list[dict]], targets: list[datetime.date]) -> str:
+    lines = ["后验拦截汇总（仅差异项，按机器去重）"]
+    for d in targets:
+        key = d.isoformat()
+        data = summary.get(key) or {}
+        rows = list(buckets.get(key) or [])
+        lines.append(f"{key} 拦截机器: {int(data.get('count') or 0)} 台")
+        for idx, (reason, count) in enumerate(data.get("top_reasons") or [], start=1):
+            lines.append(f"  差异Top{idx}: {reason} ({count})")
+        if rows:
+            lines.append(f"{key} 机器明细:")
+            for idx, row in enumerate(rows, start=1):
+                reason_text = "；".join(list(row.get("reasons") or [])[:5])
+                lines.append(
+                    f"{idx}. 型号:{row.get('model') or '-'} "
+                    f"qc:{row.get('qc_code') or '-'} "
+                    f"原因:{reason_text} 图片:{row.get('photo') or '-'}"
+                )
+        else:
+            lines.append(f"{key} 机器明细: 无")
+    return "\n".join(lines)
+
+
+def _build_bitable_record(row: dict) -> dict:
+    photos = [str(x) for x in (row.get("flawed_photos") or []) if str(x).strip()]
+    reason = f"{row.get('qc_item_name') or '-'} / {row.get('post_qc_result') or '-'}"
+    text = (
+        f"型号:{row.get('model') or row.get('title') or '-'} | "
+        f"质检码:{row.get('qc_code') or '-'} | "
+        f"拦截原因:{reason} | "
+        f"拦截图片:{(photos[0] if photos else '-')} | "
+        f"日期:{row.get('event_time') or row.get('apply_return_time') or row.get('sold_time') or '-'}"
+    )
+    return {"fields": {"文本": text}}
+
+
+def _write_intercepts_to_bitable(*, app_id: str, app_secret: str, app_token: str, table_id: str, rows: list[dict]) -> tuple[int, int, str]:
+    state = _load_intercept_state()
+    written_keys = set(state.get("written_keys") or [])
+    new_rows: list[dict] = []
+    for row in rows:
+        key = _intercept_row_key(row)
+        if key in written_keys:
+            continue
+        row["_dedup_key"] = key
+        new_rows.append(row)
+    if not new_rows:
+        return 0, len(rows), "no new rows"
+
+    token_resp = requests.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": app_id, "app_secret": app_secret},
+        timeout=10,
+    )
+    token_data = token_resp.json() if token_resp.content else {}
+    tenant_token = str(token_data.get("tenant_access_token") or "")
+    if not tenant_token:
+        return 0, len(rows), f"token failed: {token_data}"
+
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
+    headers = {"Authorization": f"Bearer {tenant_token}", "Content-Type": "application/json"}
+
+    created = 0
+    batch_size = 100
+    for i in range(0, len(new_rows), batch_size):
+        chunk = new_rows[i:i + batch_size]
+        payload = {"records": [_build_bitable_record(row) for row in chunk]}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        data = resp.json() if resp.content else {}
+        if int(data.get("code", -1)) != 0:
+            return created, len(rows), f"bitable failed: {data}"
+        created += len(chunk)
+        for row in chunk:
+            key = str(row.get("_dedup_key") or "").strip()
+            if key:
+                written_keys.add(key)
+
+    state["written_keys"] = sorted(written_keys)
+    _save_intercept_state(state)
+    return created, len(rows), "ok"
+
+
+def _parse_target_dates(raw: str) -> list[datetime.date]:
+    text = str(raw or "").strip().lower()
+    today = datetime.date.today()
+    if not text or text in {"today", "今日"}:
+        return [today]
+    if text in {"yesterday", "昨日"}:
+        return [today - datetime.timedelta(days=1)]
+    if text in {"today,yesterday", "yesterday,today", "今日,昨日", "昨日,今日"}:
+        return [today - datetime.timedelta(days=1), today]
+    dates: list[datetime.date] = []
+    for part in [x.strip() for x in text.split(",") if x.strip()]:
+        try:
+            dates.append(datetime.datetime.strptime(part, "%Y-%m-%d").date())
+        except Exception:
+            continue
+    return dates or [today]
+
+
+def _build_post_qc_message_and_write(runtime: AgentRuntime, report_dates: str, app_id: str, app_secret: str, app_token: str, table_id: str) -> tuple[str, int, int, str]:
+    target_dates = _parse_target_dates(report_dates)
+    fetch_days = max((datetime.date.today() - min(target_dates)).days + 1, 1)
+    rows = _fetch_post_qc_intercepts(runtime, days=fetch_days)
+    summary, buckets = _build_intercept_summary_by_days(rows, target_dates)
+
+    created = 0
+    scanned = len(rows)
+    write_note = "skip write"
+    if app_id and app_secret and app_token and table_id:
+        created, scanned, write_note = _write_intercepts_to_bitable(
+            app_id=app_id,
+            app_secret=app_secret,
+            app_token=app_token,
+            table_id=table_id,
+            rows=rows,
+        )
+    message = _format_intercept_summary_message(summary, buckets, target_dates)
+    return message, created, scanned, write_note
+
+
+def _run_post_qc_report(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    app_id = str(getattr(args, "feishu_app_id", "") or "").strip()
+    app_secret = str(getattr(args, "feishu_app_secret", "") or "").strip()
+    app_token = str(getattr(args, "feishu_app_token", "") or "").strip()
+    table_id = str(getattr(args, "feishu_table_id", "") or "").strip()
+    report_dates = str(getattr(args, "report_dates", "today,yesterday") or "today,yesterday")
+
+    message, created, scanned, write_note = _build_post_qc_message_and_write(
+        runtime,
+        report_dates,
+        app_id,
+        app_secret,
+        app_token,
+        table_id,
+    )
+
+    pushed, reason = runtime.feishu_robot_notifier.send_text(message)
+    _log(f"post_qc summary push: {'ok' if pushed else 'failed'} ({reason})")
+    _log(f"post_qc write: created={created}, scanned={scanned}, note={write_note}")
+    try:
+        get_mysql_store().write_post_qc_intercepts(_fetch_post_qc_intercepts(runtime, days=2))
+    except Exception:
+        pass
+
+    app_id2, app_secret2, app_token2, table_id2 = _usage_bitable_target(runtime, args)
+    usage_ok, usage_reason = _write_usage_to_bitable(
+        app_id=app_id2,
+        app_secret=app_secret2,
+        app_token=app_token2,
+        table_id=table_id2,
+        entry={
+            "agent_user_id": str(getattr(args, "agent_user_id", "") or "").strip() or "anonymous",
+            "ts": _now_text(),
+            "command": "post-qc-report",
+            "tasks": "post_qc_report",
+            "ok": 1 if pushed else 0,
+            "skip": 0,
+            "fail": 0 if pushed else 1,
+            "manual_review": 0,
+            "persisted": int(created or 0),
+            "turnover_rate": "-",
+            "note": f"scanned={scanned} write_note={write_note}",
+        },
+    )
+    _log(f"Usage log push: {'ok' if usage_ok else 'skip/failed'} ({usage_reason})")
+    try:
+        get_mysql_store().write_usage_log({
+            "agent_user_id": str(getattr(args, "agent_user_id", "") or "").strip() or "anonymous",
+            "ts": _now_text(),
+            "command": "post-qc-report",
+            "tasks": "post_qc_report",
+            "ok": 1 if pushed else 0,
+            "skip": 0,
+            "fail": 0 if pushed else 1,
+            "manual_review": 0,
+            "persisted": int(created or 0),
+            "turnover_rate": "-",
+            "note": f"scanned={scanned} write_note={write_note}",
+        })
+    except Exception:
+        pass
+
+    _log("说明: 写表去重；汇总按你选择的日期分开统计并带文字明细。")
+    return 0 if pushed else 2
+
+
+def _extract_report_dates_from_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw.startswith("拦截"):
+        return ""
+    remain = raw[2:].strip()
+    if remain in {"", "今", "今天", "today"}:
+        return "today"
+    if remain in {"昨", "昨天", "yesterday"}:
+        return "yesterday"
+    try:
+        datetime.datetime.strptime(remain, "%Y-%m-%d")
+        return remain
+    except Exception:
+        return ""
+
+
+def _feishu_tenant_token(app_id: str, app_secret: str) -> str:
+    resp = requests.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": app_id, "app_secret": app_secret},
+        timeout=10,
+    )
+    data = resp.json() if resp.content else {}
+    return str(data.get("tenant_access_token") or "")
+
+
+def _feishu_reply_text(tenant_token: str, open_id: str, text: str) -> tuple[bool, str]:
+    url = "https://open.feishu.cn/open-apis/im/v1/messages"
+    headers = {"Authorization": f"Bearer {tenant_token}", "Content-Type": "application/json"}
+    payload = {
+        "receive_id": open_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+    }
+    resp = requests.post(url, headers=headers, params={"receive_id_type": "open_id"}, json=payload, timeout=15)
+    data = resp.json() if resp.content else {}
+    if int(data.get("code", -1)) == 0:
+        return True, "ok"
+    return False, str(data)
+
+
+def _build_usage_bitable_record(entry: dict) -> dict:
+    fields = {
+        "用户ID": str(entry.get("agent_user_id") or "anonymous"),
+        "时间": str(entry.get("ts") or _now_text()),
+        "命令": str(entry.get("command") or "run"),
+        "任务集": str(entry.get("tasks") or "-"),
+        "成功数": _to_int(entry.get("ok"), 0),
+        "失败数": _to_int(entry.get("fail"), 0),
+        "跳过数": _to_int(entry.get("skip"), 0),
+        "待确认数": _to_int(entry.get("manual_review"), 0),
+        "改价写入数": _to_int(entry.get("persisted"), 0),
+        "动销率": str(entry.get("turnover_rate") or "-"),
+        "备注文本": str(entry.get("note") or ""),
+    }
+    return {"fields": fields}
+
+
+def _write_usage_to_bitable(*, app_id: str, app_secret: str, app_token: str, table_id: str, entry: dict) -> tuple[bool, str]:
+    if not app_id or not app_secret or not app_token or not table_id:
+        return False, "usage bitable config missing"
+    tenant_token = _feishu_tenant_token(app_id, app_secret)
+    if not tenant_token:
+        return False, "tenant token empty"
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
+    headers = {"Authorization": f"Bearer {tenant_token}", "Content-Type": "application/json"}
+    payload = {"records": [_build_usage_bitable_record(entry)]}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    data = resp.json() if resp.content else {}
+    if int(data.get("code", -1)) != 0:
+        return False, f"usage bitable failed: {data}"
+    return True, "ok"
+
+
+def _usage_bitable_target(runtime: AgentRuntime, args: argparse.Namespace | None = None) -> tuple[str, str, str, str]:
+    args = args or argparse.Namespace()
+    auth_cfg = _load_agent_auth_config()
+    app_id = str(getattr(args, "feishu_app_id", "") or runtime.wx_app_config.get("feishu_app_id", "") or "").strip()
+    app_secret = str(getattr(args, "feishu_app_secret", "") or runtime.wx_app_config.get("feishu_app_secret", "") or "").strip()
+    app_token = str(auth_cfg.get("feishu_usage_app_token") or getattr(args, "feishu_app_token", "") or runtime.wx_app_config.get("feishu_app_token", "") or "").strip()
+    table_id = str(auth_cfg.get("feishu_usage_table_id") or getattr(args, "feishu_table_id", "") or runtime.wx_app_config.get("feishu_table_id", "") or "").strip()
+    return app_id, app_secret, app_token, table_id
+
+
+def _run_feishu_event_listener(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    app_id = str(getattr(args, "feishu_app_id", "") or runtime.wx_app_config.get("feishu_app_id", "") or "").strip()
+    app_secret = str(getattr(args, "feishu_app_secret", "") or runtime.wx_app_config.get("feishu_app_secret", "") or "").strip()
+    app_token = str(getattr(args, "feishu_app_token", "") or runtime.wx_app_config.get("feishu_app_token", "") or "").strip()
+    table_id = str(getattr(args, "feishu_table_id", "") or runtime.wx_app_config.get("feishu_table_id", "") or "").strip()
+    verification_token = str(getattr(args, "feishu_verification_token", "") or runtime.wx_app_config.get("feishu_event_verification_token", "") or "").strip()
+    port = int(getattr(args, "port", 18088) or 18088)
+
+    if not app_id or not app_secret:
+        _log("feishu-listen 启动失败：缺少 feishu_app_id / feishu_app_secret")
+        return 1
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {}
+
+            if verification_token:
+                token = str(payload.get("token") or "")
+                if token and token != verification_token:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"forbidden")
+                    return
+
+            challenge = payload.get("challenge")
+            if challenge:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"challenge": challenge}).encode("utf-8"))
+                return
+
+            event = payload.get("event") or {}
+            message = event.get("message") or {}
+            sender = event.get("sender") or {}
+            sender_id = ((sender.get("sender_id") or {}).get("open_id")) or ""
+            text = ((message.get("content") or ""))
+            try:
+                text_json = json.loads(text) if text else {}
+                msg_text = str(text_json.get("text") or "").strip()
+            except Exception:
+                msg_text = ""
+
+            report_dates = _extract_report_dates_from_text(msg_text)
+            if report_dates and sender_id:
+                def _work():
+                    tenant_token = _feishu_tenant_token(app_id, app_secret)
+                    if not tenant_token:
+                        return
+                    _feishu_reply_text(tenant_token, sender_id, f"已受理：{msg_text}，正在统计...")
+                    report_text, created, scanned, write_note = _build_post_qc_message_and_write(
+                        runtime,
+                        report_dates,
+                        app_id,
+                        app_secret,
+                        app_token,
+                        table_id,
+                    )
+                    _feishu_reply_text(tenant_token, sender_id, report_text)
+                    usage_ok, usage_reason = _write_usage_to_bitable(
+                        app_id=app_id,
+                        app_secret=app_secret,
+                        app_token=(str(_load_agent_auth_config().get("feishu_usage_app_token") or app_token or "").strip()),
+                        table_id=(str(_load_agent_auth_config().get("feishu_usage_table_id") or table_id or "").strip()),
+                        entry={
+                            "agent_user_id": str(getattr(args, "agent_user_id", "") or "").strip() or "anonymous",
+                            "ts": _now_text(),
+                            "command": "feishu-listen",
+                            "tasks": f"post_qc:{report_dates}",
+                            "ok": 1,
+                            "skip": 0,
+                            "fail": 0,
+                            "manual_review": 0,
+                            "persisted": int(created or 0),
+                            "turnover_rate": "-",
+                            "note": f"scanned={scanned} write_note={write_note}",
+                        },
+                    )
+                    _log(f"usage log push: {'ok' if usage_ok else 'skip/failed'} ({usage_reason})")
+                    _log(f"feishu event handled: dates={report_dates}, created={created}, scanned={scanned}, note={write_note}")
+
+                threading.Thread(target=_work, daemon=True).start()
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"code":0}')
+
+        def log_message(self, *args):
+            return
+
+    server = HTTPServer(("0.0.0.0", port), _Handler)
+    _log(f"feishu-listen started on 0.0.0.0:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _log("feishu-listen stopped")
+    finally:
+        server.server_close()
+    return 0
+
+
+def _append_cycle_jsonl(payload: dict) -> tuple[bool, str]:
+    try:
+        runtime_dir = _runtime_dir()
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        output_file = runtime_dir / "agent_cycle_log.jsonl"
+        with output_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        try:
+            get_mysql_store().write_cycle_log(payload)
+        except Exception:
+            pass
+        return True, str(output_file)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _push_cycle_report(runtime: AgentRuntime, message: str) -> tuple[bool, str]:
+    try:
+        feishu_sender = getattr(runtime.feishu_robot_notifier, "send_text", None)
+        if not callable(feishu_sender):
+            return False, "feishu sender unavailable"
+        feishu_ok, feishu_reason = feishu_sender(message)
+        if feishu_ok:
+            return True, "feishu robot"
+        return False, f"feishu failed: {feishu_reason}"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _run_erp_sync(runtime: AgentRuntime):
@@ -166,12 +1209,22 @@ def _run_sales_report(runtime: AgentRuntime):
     return {
         "report": task_sales_report(
             runtime.account_store,
-            notifier=None,
+            notifier=runtime.feishu_robot_notifier,
             on_progress=_log,
             imported_store=runtime.imported_store,
             wx_app_client=None,
         )
     }
+
+
+def _run_probe_perturbation(runtime: AgentRuntime):
+    return task_probe_perturbation(
+        runtime.account_store,
+        runtime.sold_cache,
+        runtime.rule_engine,
+        runtime.imported_store,
+        on_progress=_log,
+    )
 
 
 TASKS: dict[str, TaskFunc] = {
@@ -180,22 +1233,56 @@ TASKS: dict[str, TaskFunc] = {
     "stale_drop": _run_stale_drop,
     "auto_list": _run_auto_list,
     "sales_report": _run_sales_report,
+    "probe_perturbation": _run_probe_perturbation,
 }
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Headless agent runner for zhuanzhuan automation")
+    parser.add_argument("--agent-user-id", default="", help="Agent user id for auth and telemetry")
+    parser.add_argument("--agent-access-key", default="", help="Agent access key for auth")
     subparsers = parser.add_subparsers(dest="command")
 
     run_parser = subparsers.add_parser("run", help="Run scheduled automation loop")
     run_parser.add_argument(
         "--tasks",
-        default="erp_sync,auto_reprice",
-        help="Comma-separated task list. Available: erp_sync,auto_reprice,stale_drop,auto_list,sales_report",
+        default="erp_sync,auto_reprice,auto_list,probe_perturbation",
+        help="Comma-separated task list. Available: erp_sync,auto_reprice,stale_drop,auto_list,sales_report,probe_perturbation",
     )
     run_parser.add_argument("--interval-seconds", type=int, default=300, help="Interval between cycles")
     run_parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     run_parser.add_argument("--max-cycles", type=int, default=0, help="Stop after N cycles (0 means unlimited)")
+    run_parser.add_argument(
+        "--post-manual-review-mode",
+        default="reject_and_ignore",
+        choices=["off", "reject_and_ignore"],
+        help="Post-cycle manual review resolution mode",
+    )
+    run_parser.add_argument(
+        "--post-manual-review-source-filter",
+        default="",
+        help="Comma-separated manual_review_source filter, e.g. probe_perturbation,auto_reprice",
+    )
+    run_parser.add_argument(
+        "--turnover-date",
+        default="",
+        help="Turnover statistics date in YYYY-MM-DD format (default: today)",
+    )
+
+    report_parser = subparsers.add_parser("post-qc-report", help="Collect post-QC intercepts, write Bitable with dedup, and push summary")
+    report_parser.add_argument("--feishu-app-id", default="", help="Feishu app id")
+    report_parser.add_argument("--feishu-app-secret", default="", help="Feishu app secret")
+    report_parser.add_argument("--feishu-app-token", default="", help="Feishu bitable app token")
+    report_parser.add_argument("--feishu-table-id", default="", help="Feishu bitable table id")
+    report_parser.add_argument("--report-dates", default="today,yesterday", help="today/yesterday 或 YYYY-MM-DD,YYYY-MM-DD")
+
+    feishu_listen_parser = subparsers.add_parser("feishu-listen", help="Listen Feishu event callbacks and trigger post-qc report by keywords")
+    feishu_listen_parser.add_argument("--port", type=int, default=18088, help="Local listen port for Feishu event callback")
+    feishu_listen_parser.add_argument("--feishu-app-id", default="", help="Feishu app id")
+    feishu_listen_parser.add_argument("--feishu-app-secret", default="", help="Feishu app secret")
+    feishu_listen_parser.add_argument("--feishu-app-token", default="", help="Feishu bitable app token")
+    feishu_listen_parser.add_argument("--feishu-table-id", default="", help="Feishu bitable table id")
+    feishu_listen_parser.add_argument("--feishu-verification-token", default="", help="Feishu event verification token")
 
     config_parser = subparsers.add_parser("config", help="Manage multi-store account config")
     config_sub = config_parser.add_subparsers(dest="config_command")
@@ -223,7 +1310,28 @@ def _parse_args() -> argparse.Namespace:
         help="How to resolve pending manual review items",
     )
 
+    interactive_review_parser = config_sub.add_parser(
+        "manual-review-interactive",
+        help="Interactively resolve pending manual review items with timeout",
+    )
+    interactive_review_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=20,
+        help="Seconds to wait for each decision before fallback to UI confirmation",
+    )
+
     return parser.parse_args()
+
+
+def _parse_turnover_date(raw: str) -> datetime.date | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Invalid --turnover-date: {text} (expected YYYY-MM-DD)") from exc
 
 
 def _normalize_task_names(raw: str) -> list[str]:
@@ -299,15 +1407,40 @@ def _save_account_interactive(args: argparse.Namespace) -> int:
     return _save_account(payload)
 
 
-def _resolve_pending_manual_review(mode: str, runtime: AgentRuntime | None = None) -> int:
-    ctx = runtime or AgentRuntime()
-    items = ctx.imported_store.get_all()
-    pending_ids = [
-        item.product_id
+def _pending_manual_review_items(runtime: AgentRuntime) -> list:
+    items = runtime.imported_store.get_all()
+    return [
+        item
         for item in items
         if str(getattr(item, "manual_review_state", "") or "").strip().lower() == MANUAL_REVIEW_STATE_PENDING
         or str(getattr(item, "op_status", "") or "").strip() == "待确认"
     ]
+
+
+def _parse_source_filter(raw: str) -> set[str]:
+    return {
+        part.strip().lower()
+        for part in str(raw or "").split(",")
+        if str(part or "").strip()
+    }
+
+
+def _filter_pending_manual_review_items(items: list, source_filter: set[str]) -> list:
+    if not source_filter:
+        return list(items)
+    filtered = []
+    for item in items:
+        source = str(getattr(item, "manual_review_source", "") or "").strip().lower()
+        if source in source_filter:
+            filtered.append(item)
+    return filtered
+
+
+def _resolve_pending_manual_review(mode: str, runtime: AgentRuntime | None = None, source_filter: set[str] | None = None) -> int:
+    ctx = runtime or AgentRuntime()
+    pending_items = _pending_manual_review_items(ctx)
+    selected_items = _filter_pending_manual_review_items(pending_items, source_filter or set())
+    pending_ids = [item.product_id for item in selected_items if getattr(item, "product_id", "")]
     if not pending_ids:
         _log("待确认处理: 无待确认商品")
         return 0
@@ -323,10 +1456,148 @@ def _resolve_pending_manual_review(mode: str, runtime: AgentRuntime | None = Non
         MANUAL_REVIEW_ACTION_REJECT_AND_IGNORE,
         on_progress=_log,
     )
+    try:
+        ctx.imported_store.save_to_file(ctx.imported_pool_file)
+        _log(f"待确认处理后已保存导入池: {ctx.imported_store.count()} 条")
+    except Exception as exc:
+        _log(f"待确认处理后保存导入池失败: {exc}")
     ok = int(result.get("ok") or 0)
     fail = int(result.get("fail") or 0)
-    _log(f"待确认处理完成: total={len(pending_ids)}, ok={ok}, fail={fail}, mode={mode}")
+    source_note = "all" if not source_filter else ",".join(sorted(source_filter))
+    _log(f"待确认处理完成: total={len(pending_ids)}, ok={ok}, fail={fail}, mode={mode}, sources={source_note}")
     return 0 if fail == 0 else 2
+
+def _readline_with_timeout(timeout_seconds: int) -> str | None:
+    wait_seconds = max(int(timeout_seconds or 0), 1)
+    _log(f"等待输入（{wait_seconds}s，超时自动跳过并转 UI 人工确认）...")
+    ready, _, _ = select.select([sys.stdin], [], [], wait_seconds)
+    if not ready:
+        return None
+    line = sys.stdin.readline()
+    if line is None:
+        return None
+    return str(line).strip()
+
+
+def _action_label(action: str) -> str:
+    mapping = {
+        "accept": "接受并执行",
+        "reject": "永久拒绝",
+        "reject_and_ignore": "拒绝并移入不处理区",
+        "skip": "本条跳过",
+    }
+    return mapping.get(str(action or "").strip().lower(), str(action or ""))
+
+
+def _manual_review_item_mark(item) -> str:
+    return str(getattr(item, "qc_code", "") or getattr(item, "product_id", "") or "-")
+
+
+def _manual_review_interactive(timeout_seconds: int, runtime: AgentRuntime | None = None) -> int:
+    ctx = runtime or AgentRuntime()
+    pending_items = _pending_manual_review_items(ctx)
+    if not pending_items:
+        _log("人工确认模式: 当前没有待确认商品")
+        return 0
+
+    stats = {
+        "total": len(pending_items),
+        "accepted": 0,
+        "rejected": 0,
+        "rejected_ignored": 0,
+        "skipped": 0,
+        "timeout": 0,
+        "fail": 0,
+    }
+    rows: list[list[str]] = []
+    _log(f"人工确认模式启动: 待确认 {len(pending_items)} 件")
+
+    for index, item in enumerate(pending_items, start=1):
+        product_id = str(getattr(item, "product_id", "") or "").strip()
+        if not product_id:
+            stats["skipped"] += 1
+            rows.append([str(index), "-", "缺少 product_id", "跳过", "该商品缺少 product_id，无法确认"])
+            continue
+
+        account = str(getattr(item, "account_name", "") or "-")
+        mark = _manual_review_item_mark(item)
+        current_price = _fmt_money(getattr(item, "current_price", None))
+        target_price = _fmt_money(getattr(item, "manual_review_target_price", None) or getattr(item, "new_price", None) or getattr(item, "suggested_price", None))
+        reason = str(getattr(item, "manual_review_reason", "") or "-")
+        target_action = str(getattr(item, "manual_review_target_action", "") or "change_price")
+
+        _log(f"[{index}/{len(pending_items)}] [{account}] [{mark}] 当前价={current_price} 目标价={target_price} 动作={target_action}")
+        _log(f"  待确认原因: {reason}")
+        _log("  请选择: [a]accept [r]reject [i]reject_and_ignore [s]skip（默认超时 skip）")
+
+        raw = _readline_with_timeout(timeout_seconds)
+        timed_out = raw is None
+        if timed_out:
+            action = "skip"
+            stats["timeout"] += 1
+            _log("  输入超时：本条已跳过。请到 UI 人工确认。")
+        else:
+            normalized = str(raw or "").strip().lower()
+            action_map = {
+                "a": "accept",
+                "accept": "accept",
+                "r": "reject",
+                "reject": "reject",
+                "i": "reject_and_ignore",
+                "reject_and_ignore": "reject_and_ignore",
+                "s": "skip",
+                "skip": "skip",
+                "": "skip",
+            }
+            action = action_map.get(normalized, "skip")
+            if action == "skip" and normalized not in {"", "s", "skip"}:
+                _log(f"  未识别输入 '{normalized}'，已按 skip 处理。")
+
+        if action == "skip":
+            stats["skipped"] += 1
+            msg = "超时跳过，请到 UI 人工确认" if timed_out else "手动跳过，请到 UI 人工确认"
+            rows.append([str(index), mark, reason[:28], _action_label(action), msg])
+            continue
+
+        success, message = apply_manual_review_decision(
+            ctx.account_store,
+            ctx.imported_store,
+            product_id,
+            action,
+            on_progress=_log,
+        )
+        if success:
+            if action == "accept":
+                stats["accepted"] += 1
+            elif action == "reject":
+                stats["rejected"] += 1
+            elif action == "reject_and_ignore":
+                stats["rejected_ignored"] += 1
+            rows.append([str(index), mark, reason[:28], _action_label(action), "成功"])
+            _log(f"  执行结果: 成功（{_action_label(action)}）")
+        else:
+            stats["fail"] += 1
+            err_text = str(message or "执行失败")
+            rows.append([str(index), mark, reason[:28], _action_label(action), err_text[:48]])
+            _log(f"  执行结果: 失败（{err_text}）")
+
+    _log("人工确认处理明细:")
+    _log("\n" + _format_table(["#", "Item", "Reason", "Action", "Result"], rows))
+
+    summary_rows = [[
+        str(stats["total"]),
+        str(stats["accepted"]),
+        str(stats["rejected"]),
+        str(stats["rejected_ignored"]),
+        str(stats["skipped"]),
+        str(stats["timeout"]),
+        str(stats["fail"]),
+    ]]
+    _log("人工确认汇总:")
+    _log("\n" + _format_table(["Total", "Accepted", "Rejected", "RejectedIgnored", "Skipped", "Timeout", "Fail"], summary_rows))
+
+    _log("提示: 本次 skip/timeout 的商品可在 UI 中继续人工确认。")
+    return 0 if stats["fail"] == 0 else 2
 
 
 def _list_accounts() -> int:
@@ -396,7 +1667,45 @@ def _print_validation_summary(summary: dict[str, object]) -> None:
         _log(f"  SKIP {line}")
 
 
-def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles: int) -> int:
+def _mysql_summary_tables() -> list[str]:
+    return [
+        "agent_cycle_logs",
+        "price_changes",
+        "sold_records",
+        "batch_items_snapshot",
+        "post_qc_intercepts",
+        "agent_usage_logs",
+    ]
+
+
+def _collect_mysql_table_counts() -> tuple[dict[str, int], dict[str, str]]:
+    store = get_mysql_store()
+    counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    for table in _mysql_summary_tables():
+        ok, msg, count = store.count_rows(table)
+        if ok:
+            counts[table] = int(count)
+        else:
+            errors[table] = str(msg or "unknown error")
+    return counts, errors
+
+
+def _build_mysql_delta_summary_message(*, cycle: int, deltas: dict[str, int], errors: dict[str, str]) -> str:
+    lines = [f"📦 MySQL 增量摘要 #{cycle}"]
+    total_delta = sum(max(int(v or 0), 0) for v in deltas.values())
+    lines.append(f"本轮新增总计：{total_delta}")
+    for table in _mysql_summary_tables():
+        if table in errors:
+            lines.append(f"- {table}: 查询失败 ({errors[table][:64]})")
+        else:
+            lines.append(f"- {table}: +{max(int(deltas.get(table, 0)), 0)}")
+    if total_delta <= 0 and not errors:
+        lines.append("本轮无新增数据")
+    return "\n".join(lines)
+
+
+def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles: int, post_manual_review_mode: str = "reject_and_ignore", post_manual_review_source_filter: str = "", agent_user_id: str = "", turnover_date: datetime.date | None = None) -> int:
     runtime = AgentRuntime()
     preflight = _validate_cookies(include_disabled=False)
     _print_validation_summary(preflight)
@@ -407,13 +1716,60 @@ def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles:
     cycles = 0
     interval = max(int(interval_seconds or 1), 1)
     cap = max(int(max_cycles or 0), 0)
-    _log(f"Agent runner started. tasks={tasks}, interval={interval}s, once={once}, max_cycles={cap}")
+    source_filter = _parse_source_filter(post_manual_review_source_filter)
+    source_filter_note = "all" if not source_filter else ",".join(sorted(source_filter))
+    network_fail_streak = 0
+    network_cooldown_until: datetime.datetime | None = None
+    turnover_date_note = turnover_date.isoformat() if turnover_date else "today"
+    _log(
+        f"Agent runner started. tasks={tasks}, interval={interval}s, once={once}, max_cycles={cap}, "
+        f"post_manual_review_mode={post_manual_review_mode}, post_manual_review_sources={source_filter_note}, "
+        f"turnover_date={turnover_date_note}"
+    )
+
+    mysql_baseline_counts: dict[str, int] = {}
+    mysql_baseline_errors: dict[str, str] = {}
+    if bool(cfg.get("mysql_delta_report_enabled", True)):
+        mysql_baseline_counts, mysql_baseline_errors = _collect_mysql_table_counts()
+        if mysql_baseline_errors:
+            _log(f"MySQL baseline collect warning: {mysql_baseline_errors}")
 
     while True:
         cycles += 1
         _log(f"Cycle {cycles} started")
+        now = datetime.datetime.now()
+        if network_cooldown_until is not None and now < network_cooldown_until:
+            remain = int((network_cooldown_until - now).total_seconds())
+            _log(f"network_state=offline phase=preflight action=cooldown remain={remain}s")
+            if once:
+                return 0
+            next_time = datetime.datetime.now() + datetime.timedelta(seconds=interval)
+            _log(f"Cycle {cycles} idle: waiting {interval}s, next cycle at {next_time.strftime('%H:%M:%S')}")
+            time.sleep(interval)
+            continue
+
+        network_ok, network_reason = _network_preflight(timeout_seconds=1.5)
+        if not network_ok:
+            network_fail_streak += 1
+            _log(f"network_state=offline phase=preflight action=skip reason={network_reason}")
+            if network_fail_streak >= 3:
+                network_cooldown_until = datetime.datetime.now() + datetime.timedelta(minutes=5)
+                _log("network_state=offline phase=preflight action=cooldown trigger=streak>=3 window=300s")
+            if once:
+                return 0
+            next_time = datetime.datetime.now() + datetime.timedelta(seconds=interval)
+            _log(f"Cycle {cycles} idle: waiting {interval}s, next cycle at {next_time.strftime('%H:%M:%S')}")
+            time.sleep(interval)
+            continue
+
+        network_fail_streak = 0
+        network_cooldown_until = None
+        _log("network_state=online phase=preflight action=pass")
+
+        inventory_before = _snapshot_inventory_state(runtime)
         task_rows: list[list[str]] = []
         persisted_rows: list[list[str]] = []
+        risk_stats: dict[str, dict[str, int]] = {}
 
         for name in tasks:
             fn = TASKS[name]
@@ -422,6 +1778,17 @@ def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles:
                 result = fn(runtime)
                 task_rows.append(_build_task_summary_row(name, result))
                 persisted_rows.extend(_collect_persisted_rows(name, result))
+                risk_bucket = _collect_risk_bucket(name, result)
+                task_data = result if isinstance(result, dict) else {}
+                task_ok = _to_int(task_data.get("ok"), 0)
+                task_skip = _to_int(task_data.get("skip"), 0)
+                task_manual = _to_int(task_data.get("manual_review"), 0)
+                for source, count in risk_bucket.items():
+                    slot = risk_stats.setdefault(source, {"count": 0, "auto_passed": 0, "manual_review": 0, "skipped": 0})
+                    slot["count"] += _to_int(count, 0)
+                    slot["manual_review"] += min(task_manual, _to_int(count, 0))
+                    slot["skipped"] += min(task_skip, _to_int(count, 0))
+                    slot["auto_passed"] += min(task_ok, _to_int(count, 0))
             except Exception as exc:
                 error_text = str(exc or "unknown error")
                 _log(f"Task {name} failed: {error_text}")
@@ -436,20 +1803,156 @@ def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles:
         )
 
         if persisted_rows:
-            _log("Cycle repricing records:")
+            _log("本轮改价记录：")
             _log(
                 "\n" + _format_table(
-                    ["Task", "Account", "Item", "Old", "New", "Diff", "Trigger"],
+                    ["任务", "账号", "商品", "原价", "新价", "差价", "型号", "成色", "质检码", "IMEI", "到手价", "调价时间", "触发器"],
                     persisted_rows,
                 )
             )
         else:
-            _log("Cycle repricing records: no persisted price changes")
+            _log("本轮改价记录：无已落库改价")
 
-        _log("Cycle post-process: resolve manual review (reject_and_ignore)")
-        post_review_code = _resolve_pending_manual_review("reject_and_ignore", runtime=runtime)
-        if post_review_code != 0:
-            _log(f"Cycle post-process warning: resolve-manual-review exit={post_review_code}")
+        risk_rows = _build_risk_summary_rows(risk_stats)
+        if risk_rows:
+            _log("本轮风险汇总：")
+            _log(
+                "\n" + _format_table(
+                    ["风险来源", "条数", "自动通过", "待人工确认", "跳过"],
+                    risk_rows,
+                )
+            )
+            risk_summary_text = _risk_natural_summary(risk_stats)
+            _log(risk_summary_text)
+        else:
+            risk_summary_text = "本轮无风险标签数据"
+            _log("本轮风险汇总：无风险分桶数据")
+
+        inventory_after = _snapshot_inventory_state(runtime)
+        inventory_change_rows = _collect_inventory_changes(inventory_before, inventory_after)
+        if inventory_change_rows:
+            _log("本轮库存状态变化：")
+            _log("\n" + _format_table(["Account", "Item", "From", "To"], inventory_change_rows[:20]))
+        else:
+            _log("本轮库存状态变化：无状态变化")
+
+        turnover_metrics = _collect_turnover_metrics(runtime, target_date=turnover_date)
+        sold_today = _to_int(turnover_metrics.get("sold_today"), 0)
+        on_sale_count = _to_int(turnover_metrics.get("on_sale_count"), 0)
+        turnover_rate = float(turnover_metrics.get("turnover_rate") or 0.0)
+        _log(f"动销统计：今日销售 {sold_today}，在架数量 {on_sale_count}，动销率 {turnover_rate:.2%}")
+
+        cycle_report_text = _build_cycle_report_message(
+            cycle=cycles,
+            task_rows=task_rows,
+            persisted_rows=persisted_rows,
+            risk_stats=risk_stats,
+            risk_summary_text=risk_summary_text,
+            inventory_change_rows=inventory_change_rows,
+            turnover_metrics=turnover_metrics,
+        )
+        cycle_payload = {
+            "ts": _now_text(),
+            "cycle": cycles,
+            "tasks": tasks,
+            "task_rows": task_rows,
+            "persisted_rows": persisted_rows,
+            "risk_stats": risk_stats,
+            "risk_summary": risk_summary_text,
+            "inventory_change_rows": inventory_change_rows,
+            "turnover_metrics": turnover_metrics,
+            "post_manual_review_mode": post_manual_review_mode,
+            "post_manual_review_source_filter": sorted(source_filter),
+            "agent_user_id": str(agent_user_id or "").strip() or "anonymous",
+            "run_mode": "run",
+        }
+        logged, log_target = _append_cycle_jsonl(cycle_payload)
+        if logged:
+            _log(f"Cycle log appended: {log_target}")
+        else:
+            _log(f"Cycle log append failed: {log_target}")
+
+        total_ok = sum(_to_int(row[2], 0) for row in task_rows if len(row) >= 3)
+        total_skip = sum(_to_int(row[3], 0) for row in task_rows if len(row) >= 4)
+        total_fail = sum(_to_int(row[4], 0) for row in task_rows if len(row) >= 5)
+        total_manual = sum(_to_int(row[5], 0) for row in task_rows if len(row) >= 6)
+        usage_entry = {
+            "agent_user_id": str(agent_user_id or "").strip() or "anonymous",
+            "ts": _now_text(),
+            "command": "run",
+            "tasks": ",".join(tasks),
+            "ok": total_ok,
+            "skip": total_skip,
+            "fail": total_fail,
+            "manual_review": total_manual,
+            "persisted": len(persisted_rows),
+            "turnover_rate": f"{turnover_rate:.2%}",
+            "note": risk_summary_text,
+        }
+        app_id, app_secret, app_token, table_id = _usage_bitable_target(runtime)
+        usage_ok, usage_reason = _write_usage_to_bitable(
+            app_id=app_id,
+            app_secret=app_secret,
+            app_token=app_token,
+            table_id=table_id,
+            entry=usage_entry,
+        )
+        _log(f"Usage log push: {'ok' if usage_ok else 'skip/failed'} ({usage_reason})")
+        try:
+            get_mysql_store().write_usage_log(usage_entry)
+        except Exception:
+            pass
+
+        pushed, push_reason = _push_cycle_report(runtime, cycle_report_text)
+        if pushed:
+            _log(f"Cycle report push: sent ({push_reason})")
+        else:
+            _log(f"Cycle report push: failed ({push_reason})")
+
+        if bool(cfg.get("mysql_delta_report_enabled", True)):
+            mysql_current_counts, mysql_current_errors = _collect_mysql_table_counts()
+            mysql_deltas: dict[str, int] = {}
+            for table in _mysql_summary_tables():
+                base = int(mysql_baseline_counts.get(table, 0))
+                curr = int(mysql_current_counts.get(table, base))
+                mysql_deltas[table] = curr - base
+            mysql_delta_message = _build_mysql_delta_summary_message(
+                cycle=cycles,
+                deltas=mysql_deltas,
+                errors=mysql_current_errors,
+            )
+            delta_pushed, delta_reason = _push_cycle_report(runtime, mysql_delta_message)
+            if delta_pushed:
+                _log(f"MySQL delta summary push: sent ({delta_reason})")
+            else:
+                _log(f"MySQL delta summary push: failed ({delta_reason})")
+            mysql_baseline_counts = dict(mysql_current_counts)
+            mysql_baseline_errors = dict(mysql_current_errors)
+
+        if post_manual_review_mode == "off":
+            _log("Cycle post-process: manual review resolver disabled")
+        else:
+            _log(f"Cycle post-process: resolve manual review async ({post_manual_review_mode})")
+
+            def _resolve_manual_review_async() -> None:
+                try:
+                    post_review_code = _resolve_pending_manual_review(
+                        post_manual_review_mode,
+                        runtime=runtime,
+                        source_filter=source_filter,
+                    )
+                    if post_review_code != 0:
+                        _log(f"Cycle post-process warning: resolve-manual-review exit={post_review_code}")
+                except Exception as exc:
+                    _log(f"Cycle post-process async error: {exc}")
+
+            threading.Thread(target=_resolve_manual_review_async, daemon=True).start()
+
+        try:
+            runtime.imported_store.save_to_file(runtime.imported_pool_file)
+            _log(f"导入商品池已保存: {runtime.imported_store.count()} 条")
+        except Exception as exc:
+            _log(f"导入商品池保存失败: {exc}")
 
         _log(f"Cycle {cycles} finished")
 
@@ -465,14 +1968,43 @@ def run_loop(tasks: list[str], *, interval_seconds: int, once: bool, max_cycles:
 def main() -> int:
     args = _parse_args()
 
+    if args.command in (None, "run", "post-qc-report", "feishu-listen"):
+        auth_cfg = _load_agent_auth_config()
+        user_id = str(getattr(args, "agent_user_id", "") or "").strip()
+        access_key = str(getattr(args, "agent_access_key", "") or "")
+        if bool(auth_cfg.get("auth_required", False)) and not user_id:
+            user_id = input("Agent 用户名: ").strip()
+        if bool(auth_cfg.get("auth_required", False)) and not access_key:
+            access_key = getpass.getpass("Agent 密码: ").strip()
+        setattr(args, "agent_user_id", user_id)
+        auth_ok, auth_reason = _verify_agent_access(user_id=user_id, access_key=access_key)
+        if not auth_ok:
+            _log(f"Agent auth failed: {auth_reason}")
+            return 1
+        if user_id:
+            _log(f"Agent auth passed: user={user_id}")
+
     if args.command in (None, "run"):
         task_names = _normalize_task_names(getattr(args, "tasks", "erp_sync,auto_reprice"))
+        turnover_date = _parse_turnover_date(getattr(args, "turnover_date", ""))
         return run_loop(
             task_names,
             interval_seconds=int(getattr(args, "interval_seconds", 300) or 300),
             once=bool(getattr(args, "once", False)),
             max_cycles=int(getattr(args, "max_cycles", 0) or 0),
+            post_manual_review_mode=str(getattr(args, "post_manual_review_mode", "reject_and_ignore") or "reject_and_ignore"),
+            post_manual_review_source_filter=str(getattr(args, "post_manual_review_source_filter", "") or ""),
+            agent_user_id=str(getattr(args, "agent_user_id", "") or "").strip(),
+            turnover_date=turnover_date,
         )
+
+    if args.command == "post-qc-report":
+        runtime = AgentRuntime()
+        return _run_post_qc_report(runtime, args)
+
+    if args.command == "feishu-listen":
+        runtime = AgentRuntime()
+        return _run_feishu_event_listener(runtime, args)
 
     if args.command == "config":
         sub = getattr(args, "config_command", None)
@@ -488,6 +2020,8 @@ def main() -> int:
             return 0 if len(summary.get("failed") or []) == 0 else 2
         if sub == "resolve-manual-review":
             return _resolve_pending_manual_review(str(getattr(args, "mode", "reject_and_ignore")))
+        if sub == "manual-review-interactive":
+            return _manual_review_interactive(int(getattr(args, "timeout_seconds", 20) or 20))
         _log("Unknown config subcommand")
         return 1
 
